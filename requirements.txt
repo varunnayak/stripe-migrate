@@ -1,1 +1,2 @@
 stripe==10.8.0
+python-dotenv

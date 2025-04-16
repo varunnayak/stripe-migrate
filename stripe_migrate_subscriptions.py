@@ -1,16 +1,20 @@
 import os
 from typing import Any, Dict, List, Optional
+import argparse
 
 import stripe
+from dotenv import load_dotenv
 
-API_KEY_OLD: Optional[str] = os.getenv("API_KEY_OLD")
-API_KEY_NEW: Optional[str] = os.getenv("API_KEY_NEW")
+load_dotenv()
+
+API_KEY_SOURCE: Optional[str] = os.getenv("API_KEY_SOURCE")
+API_KEY_TARGET: Optional[str] = os.getenv("API_KEY_TARGET")
 
 # Ensure API keys are set
-if not API_KEY_OLD:
-    raise ValueError("API_KEY_OLD environment variable not set.")
-if not API_KEY_NEW:
-    raise ValueError("API_KEY_NEW environment variable not set.")
+if not API_KEY_SOURCE:
+    raise ValueError("API_KEY_SOURCE environment variable not set.")
+if not API_KEY_TARGET:
+    raise ValueError("API_KEY_TARGET environment variable not set.")
 
 
 def get_stripe_client(api_key: str) -> Any:
@@ -23,8 +27,7 @@ def get_stripe_client(api_key: str) -> Any:
     Returns:
         An initialized Stripe client object.
     """
-    stripe.api_key = api_key
-    return stripe
+    return stripe.StripeClient(api_key=api_key)
 
 
 # Function to recreate a subscription in the new account
@@ -67,16 +70,22 @@ def recreate_subscription(
         return None
 
     if dry_run:
-        print("Dry run: Subscription creation skipped.")
+        print(f"  [Dry Run] Would create subscription for customer {customer_id}")
+        print(f"    Items: {items}")
+        print(
+            f"    Trial End (from old current_period_end): {subscription['current_period_end']}"
+        )
+        print(f"    Default Payment Method: {None}")
+        print("  [Dry Run] Subscription creation skipped.")
         return None
 
-    old_stripe = get_stripe_client(API_KEY_OLD)  # type: ignore
-    new_stripe = get_stripe_client(API_KEY_NEW)  # type: ignore
+    old_stripe = get_stripe_client(API_KEY_SOURCE)  # type: ignore
+    new_stripe = get_stripe_client(API_KEY_TARGET)  # type: ignore
 
     # Fetch payment methods for the customer from the old account
     try:
-        payment_methods = old_stripe.PaymentMethod.list(
-            customer=customer_id, type="card"
+        payment_methods = old_stripe.payment_methods.list(
+            params={"customer": customer_id, "type": "card"}
         )
         payment_method_id: Optional[str] = None
 
@@ -95,13 +104,13 @@ def recreate_subscription(
 
     # Create the subscription in the new account
     try:
-        new_subscription = new_stripe.Subscription.create(
-            customer=customer_id,
-            items=items,
-            # Set trial end to the end of the current period to avoid immediate billing
-            trial_end=subscription["current_period_end"],
-            default_payment_method=payment_method_id,
-            # Consider adding other relevant parameters like coupon, metadata, etc.
+        new_subscription = new_stripe.subscriptions.create(
+            params={
+                "customer": customer_id,
+                "items": items,
+                "trial_end": subscription["current_period_end"],
+                "default_payment_method": payment_method_id,
+            }
         )
         print(f"Successfully created new subscription {new_subscription.id}")
         return new_subscription
@@ -116,14 +125,14 @@ def migrate_subscriptions(dry_run: bool = True) -> None:
     to recreate them in the new Stripe account. Dynamically builds price mapping.
     """
     print(f"Starting subscription migration (dry_run={dry_run})...")
-    old_stripe = get_stripe_client(API_KEY_OLD)  # type: ignore
-    new_stripe = get_stripe_client(API_KEY_NEW)  # type: ignore # Initialize new client here
+    old_stripe = get_stripe_client(API_KEY_SOURCE)  # type: ignore
+    new_stripe = get_stripe_client(API_KEY_TARGET)  # type: ignore # Initialize new client here
 
     # --- Build price mapping dynamically ---
     print("Building price map from new account metadata...")
     price_mapping: Dict[str, str] = {}
     try:
-        prices = new_stripe.Price.list(limit=100, active=True)  # Fetch active prices
+        prices = new_stripe.prices.list(params={"limit": 100, "active": True})
         for price in prices.auto_paging_iter():
             if price.metadata and "old_price_id" in price.metadata:
                 old_id = price.metadata["old_price_id"]
@@ -143,7 +152,12 @@ def migrate_subscriptions(dry_run: bool = True) -> None:
     # --- End build price mapping ---
 
     try:
-        subscriptions = old_stripe.Subscription.list(status="active", limit=100)
+        subscriptions = old_stripe.subscriptions.list(
+            params={"status": "active", "limit": 100}
+        )
+        print(
+            f"Found {len(subscriptions.data)} active subscription(s) in the old account."
+        )
         # Loop through each subscription and recreate it in the new account
         for subscription in subscriptions.auto_paging_iter():
             # print(subscription) # Uncomment for detailed subscription info
@@ -163,17 +177,29 @@ def migrate_subscriptions(dry_run: bool = True) -> None:
                 #     except stripe.error.StripeError as e:
                 #         print(f"Error cancelling old subscription {subscription['id']}: {e}")
             else:
-                print(f"Skipped or failed recreating subscription {subscription.id}")
+                print(
+                    f"Skipped or failed recreating subscription {subscription.id} (Dry Run: {dry_run})"
+                )
 
-        print("\nSubscription migration process completed.")
+        print(f"\nSubscription migration process completed (Dry Run: {dry_run}).")
     except stripe.error.StripeError as e:
         print(f"Error fetching subscriptions from old account: {e}")
 
 
 def main() -> None:
     """Main function to run the subscription migration."""
+    parser = argparse.ArgumentParser(description="Migrate Stripe Subscriptions.")
+    parser.add_argument(
+        "--live",
+        action="store_true",
+        help="Perform the migration live. Default is dry run.",
+    )
+    args = parser.parse_args()
+
+    is_dry_run = not args.live  # dry_run is True if --live is NOT specified
+
     # Set dry_run=False to perform actual migration
-    migrate_subscriptions(dry_run=True)
+    migrate_subscriptions(dry_run=is_dry_run)
 
 
 if __name__ == "__main__":
