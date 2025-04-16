@@ -49,16 +49,20 @@ STATUS_DRY_RUN = "dry_run"
 def recreate_subscription(
     subscription: Dict[str, Any],
     price_mapping: Dict[str, str],
+    existing_target_subs_by_customer: Dict[str, set[frozenset[str]]],
     target_stripe: Any,
     source_stripe: Any,
     dry_run: bool = True,
 ) -> Tuple[str, Optional[str]]:  # Return status and subscription ID (or None)
     """
-    Recreates a given subscription in the target Stripe account.
+    Recreates a given subscription in the target Stripe account, using pre-fetched data
+    to check for existing subscriptions.
 
     Args:
         subscription: The subscription object from the source Stripe account.
         price_mapping: A dictionary mapping source price IDs to target price IDs.
+        existing_target_subs_by_customer: A dictionary mapping customer IDs to sets of frozensets of price IDs
+                                           for their active subscriptions in the target account.
         target_stripe: Initialized Stripe client for the target account.
         source_stripe: Initialized Stripe client for the source account.
         dry_run: If True, simulates the process without creating the subscription.
@@ -106,35 +110,48 @@ def recreate_subscription(
 
     logging.debug("  Mapped target items: %s", target_items)
 
-    # --- Check for existing active subscription in target account ---
-    try:
-        logging.debug(
-            "  Checking for existing active subscriptions for customer %s...",
-            customer_id,
-        )
-        existing_target_subscriptions = target_stripe.subscriptions.list(
-            params={"customer": customer_id, "status": "active", "limit": 100}
-        )
-        for existing_sub in existing_target_subscriptions.auto_paging_iter():
-            existing_sub_price_ids = {item.price.id for item in existing_sub.items.data}
-            if existing_sub_price_ids == target_price_ids_set:
-                logging.info(
-                    "  Skipping: Found existing active subscription %s for customer %s with the same price IDs.",
-                    existing_sub.id,
-                    customer_id,
-                )
-                return (
-                    STATUS_SKIPPED,
-                    existing_sub.id,
-                )  # Return skipped status and existing ID
-    except stripe.error.StripeError as list_err:
-        logging.warning(
-            "  Warning: Could not list target subscriptions for customer %s to check for duplicates: %s",
-            customer_id,
-            list_err,
-        )
-        # Decide whether to proceed or stop if check fails.
-        # For now, let's proceed but log the warning. A stricter approach might return STATUS_FAILED.
+    # --- Check for existing active subscription in target account using pre-fetched data --- (Optimization)
+    target_price_ids_frozenset = frozenset(target_price_ids_set)
+    if customer_id in existing_target_subs_by_customer:
+        customer_existing_subs_price_sets = existing_target_subs_by_customer[
+            customer_id
+        ]
+        if target_price_ids_frozenset in customer_existing_subs_price_sets:
+            logging.info(
+                "  Skipping: Customer %s already has an active subscription with the same price IDs (based on pre-fetched list).",
+                customer_id,
+            )
+            # Cannot easily get the existing sub ID from this structure, return None for ID
+            return STATUS_SKIPPED, None
+    # Removed old check block that used API call
+    # try:
+    #     logging.debug(
+    #         "  Checking for existing active subscriptions for customer %s...",
+    #         customer_id,
+    #     )
+    #     existing_target_subscriptions = target_stripe.subscriptions.list(
+    #         params={"customer": customer_id, "status": "active", "limit": 100}
+    #     )
+    #     for existing_sub in existing_target_subscriptions.auto_paging_iter():
+    #         existing_sub_price_ids = {item.price.id for item in existing_sub.items.data}
+    #         if existing_sub_price_ids == target_price_ids_set:
+    #             logging.info(
+    #                 "  Skipping: Found existing active subscription %s for customer %s with the same price IDs.",
+    #                 existing_sub.id,
+    #                 customer_id,
+    #             )
+    #             return (
+    #                 STATUS_SKIPPED,
+    #                 existing_sub.id,
+    #             )  # Return skipped status and existing ID
+    # except stripe.error.StripeError as list_err:
+    #     logging.warning(
+    #         "  Warning: Could not list target subscriptions for customer %s to check for duplicates: %s",
+    #         customer_id,
+    #         list_err,
+    #     )
+    # Decide whether to proceed or stop if check fails.
+    # For now, let's proceed but log the warning. A stricter approach might return STATUS_FAILED.
 
     # --- Dry Run Simulation ---
     if dry_run:
@@ -329,6 +346,31 @@ def migrate_subscriptions(dry_run: bool = True) -> None:
         return  # Exit if map cannot be built
     # --- End build price mapping ---
 
+    # --- Pre-fetch existing active target subscriptions --- (Optimization)
+    logging.info("Pre-fetching existing active subscriptions from target account...")
+    existing_target_subs_by_customer: Dict[str, set[frozenset[str]]] = {}
+    try:
+        target_subscriptions = target_stripe.subscriptions.list(
+            params={"status": "active", "limit": 100}
+        )
+        for sub in target_subscriptions.auto_paging_iter():
+            customer_id = sub.customer
+            price_ids = frozenset(item.price.id for item in sub.items.data)
+            if customer_id not in existing_target_subs_by_customer:
+                existing_target_subs_by_customer[customer_id] = set()
+            existing_target_subs_by_customer[customer_id].add(price_ids)
+        logging.info(
+            "Found active subscriptions for %d customers in target account.",
+            len(existing_target_subs_by_customer),
+        )
+    except stripe.error.StripeError as e:
+        logging.error(
+            "Error pre-fetching target subscriptions: %s. Proceeding without pre-check data.",
+            e,
+        )
+        # Let the script continue, checks inside recreate_subscription will fallback or fail
+    # --- End pre-fetch target subscriptions ---
+
     created_count = 0
     skipped_count = 0
     failed_count = 0
@@ -352,6 +394,7 @@ def migrate_subscriptions(dry_run: bool = True) -> None:
             status, target_sub_id = recreate_subscription(
                 subscription,
                 price_mapping,
+                existing_target_subs_by_customer,  # Pass pre-fetched data
                 target_stripe,
                 source_stripe,
                 dry_run,
