@@ -762,7 +762,7 @@ def _ensure_payment_method(
             "  Ensuring PM: Checking target customer %s for default PM...", customer_id
         )
         target_customer = target_stripe.customers.retrieve(
-            customer_id, expand=["invoice_settings.default_payment_method"]
+            customer_id, params={"expand": ["invoice_settings.default_payment_method"]}
         )
         if (
             target_customer.invoice_settings
@@ -778,65 +778,43 @@ def _ensure_payment_method(
             )
             return payment_method_id
         else:
-            # 2. If no default PM in target, check source
+            # 2. If no default PM in target, check if any PM is attached to TARGET customer
             logging.info(
-                "  Ensuring PM: No default PM in target, checking source account..."
+                "  Ensuring PM: No default PM in target, checking target account for attached cards..."
             )
-            source_pms = source_stripe.payment_methods.list(
-                params={"customer": customer_id, "type": "card", "limit": 1}
-            )
-            if source_pms.data:
-                source_pm_id = source_pms.data[0].id
-                logging.info(
-                    "  Ensuring PM: Found source PM: %s. Attaching to target...",
-                    source_pm_id,
+            try:
+                target_pms = target_stripe.payment_methods.list(
+                    params={"customer": customer_id, "type": "card", "limit": 1}
                 )
-                try:
-                    # 3. Attach source PM to target customer
-                    attached_pm = target_stripe.payment_methods.attach(
-                        source_pm_id, params={"customer": customer_id}
-                    )
-                    payment_method_id = attached_pm.id
-                    # Set as default for customer
-                    logging.debug(
-                        "  Ensuring PM: Setting %s as default PM for target customer %s...",
-                        payment_method_id,
-                        customer_id,
-                    )
-                    target_stripe.customers.update(
-                        customer_id,
-                        params={
-                            "invoice_settings": {
-                                "default_payment_method": payment_method_id
-                            }
-                        },
-                    )
+                if target_pms.data:
+                    payment_method_id = target_pms.data[0].id
                     logging.info(
-                        "  Ensuring PM: Successfully attached and set source PM as default in target: %s",
+                        "  Ensuring PM: Found existing attached card in target: %s. Using this.",
                         payment_method_id,
                     )
+                    # Optional: Update customer's default PM if needed, but often
+                    # providing it in subscription creation is enough.
+                    # target_stripe.customers.update(...)
                     return payment_method_id
-                except stripe.error.StripeError as attach_err:
-                    logging.error(
-                        "  Ensuring PM: Error attaching source PM %s to target customer %s: %s",
-                        source_pm_id,
-                        customer_id,
-                        attach_err,
-                    )
-                    # Log warning here, but failure is handled by returning None
+                else:
                     logging.warning(
-                        "  Subscription creation might fail due to payment method attachment issue."
+                        "  Ensuring PM: No default PM and no attached cards found for customer %s in target account.",
+                        customer_id,
                     )
-                    return None
-            else:
-                logging.warning(
-                    "  Ensuring PM: No suitable card payment methods found for customer %s in source account.",
+                    return None  # Cannot proceed without a PM in the target account
+
+            except stripe.error.StripeError as list_err:
+                logging.error(
+                    "  Ensuring PM: Error listing payment methods for target customer %s: %s",
                     customer_id,
+                    list_err,
                 )
-                return None  # Cannot proceed without a PM
+                return None  # Cannot proceed if we cannot check for PMs
+
     except stripe.error.StripeError as e:
+        # Error retrieving the target customer initially
         logging.error(
-            "  Ensuring PM: Error checking/attaching payment methods for customer %s: %s",
+            "  Ensuring PM: Error retrieving target customer %s: %s",
             customer_id,
             e,
         )
