@@ -30,22 +30,22 @@ def get_stripe_client(api_key: str) -> Any:
     return stripe.StripeClient(api_key=api_key)
 
 
-# Function to recreate a subscription in the new account
+# Function to recreate a subscription in the target account
 def recreate_subscription(
     subscription: Dict[str, Any],
     price_mapping: Dict[str, str],  # Added price_mapping argument
     dry_run: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """
-    Recreates a given subscription in the new Stripe account.
+    Recreates a given subscription in the target Stripe account.
 
     Args:
-        subscription: The subscription object from the old Stripe account.
-        price_mapping: A dictionary mapping old price IDs to new price IDs.
+        subscription: The subscription object from the source Stripe account.
+        price_mapping: A dictionary mapping source price IDs to target price IDs.
         dry_run: If True, simulates the process without creating the subscription.
 
     Returns:
-        The newly created subscription object from the new Stripe account, or None if
+        The newly created subscription object from the target Stripe account, or None if
         skipped or in dry_run mode.
     """
     if not price_mapping:
@@ -73,18 +73,18 @@ def recreate_subscription(
         print(f"  [Dry Run] Would create subscription for customer {customer_id}")
         print(f"    Items: {items}")
         print(
-            f"    Trial End (from old current_period_end): {subscription['current_period_end']}"
+            f"    Trial End (from source current_period_end): {subscription['current_period_end']}"
         )
         print(f"    Default Payment Method: {None}")
         print("  [Dry Run] Subscription creation skipped.")
         return None
 
-    old_stripe = get_stripe_client(API_KEY_SOURCE)  # type: ignore
-    new_stripe = get_stripe_client(API_KEY_TARGET)  # type: ignore
+    source_stripe = get_stripe_client(API_KEY_SOURCE)  # type: ignore
+    target_stripe = get_stripe_client(API_KEY_TARGET)  # type: ignore
 
-    # Fetch payment methods for the customer from the old account
+    # Fetch payment methods for the customer from the source account
     try:
-        payment_methods = old_stripe.payment_methods.list(
+        payment_methods = source_stripe.payment_methods.list(
             params={"customer": customer_id, "type": "card"}
         )
         payment_method_id: Optional[str] = None
@@ -102,9 +102,9 @@ def recreate_subscription(
         print(f"Error fetching payment methods for customer {customer_id}: {e}")
         return None
 
-    # Create the subscription in the new account
+    # Create the subscription in the target account
     try:
-        new_subscription = new_stripe.subscriptions.create(
+        target_subscription = target_stripe.subscriptions.create(
             params={
                 "customer": customer_id,
                 "items": items,
@@ -112,8 +112,8 @@ def recreate_subscription(
                 "default_payment_method": payment_method_id,
             }
         )
-        print(f"Successfully created new subscription {new_subscription.id}")
-        return new_subscription
+        print(f"Successfully created target subscription {target_subscription.id}")
+        return target_subscription
     except stripe.error.StripeError as e:
         print(f"Error creating subscription for customer {customer_id}: {e}")
         return None
@@ -121,61 +121,61 @@ def recreate_subscription(
 
 def migrate_subscriptions(dry_run: bool = True) -> None:
     """
-    Fetches all active subscriptions from the old Stripe account and attempts
-    to recreate them in the new Stripe account. Dynamically builds price mapping.
+    Fetches all active subscriptions from the source Stripe account and attempts
+    to recreate them in the target Stripe account. Dynamically builds price mapping.
     """
     print(f"Starting subscription migration (dry_run={dry_run})...")
-    old_stripe = get_stripe_client(API_KEY_SOURCE)  # type: ignore
-    new_stripe = get_stripe_client(API_KEY_TARGET)  # type: ignore # Initialize new client here
+    source_stripe = get_stripe_client(API_KEY_SOURCE)  # type: ignore
+    target_stripe = get_stripe_client(API_KEY_TARGET)  # type: ignore # Initialize target client here
 
     # --- Build price mapping dynamically ---
-    print("Building price map from new account metadata...")
+    print("Building price map from target account metadata...")
     price_mapping: Dict[str, str] = {}
     try:
-        prices = new_stripe.prices.list(params={"limit": 100, "active": True})
+        prices = target_stripe.prices.list(params={"limit": 100, "active": True})
         for price in prices.auto_paging_iter():
-            if price.metadata and "old_price_id" in price.metadata:
-                old_id = price.metadata["old_price_id"]
-                price_mapping[old_id] = price.id
+            if price.metadata and "source_price_id" in price.metadata:
+                source_id = price.metadata["source_price_id"]
+                price_mapping[source_id] = price.id
                 # Optional: print mapping for verification
-                # print(f"  Mapped old price {old_id} -> new price {price.id}")
+                # print(f"  Mapped source price {source_id} -> target price {price.id}")
         print(f"Price map built successfully. Found {len(price_mapping)} mappings.")
         if not price_mapping:
             print(
-                "Warning: Price map is empty. Ensure products/prices were migrated correctly with 'old_price_id' in metadata."
+                "Warning: Price map is empty. Ensure products/prices were migrated correctly with 'source_price_id' in metadata."
             )
 
     except stripe.error.StripeError as e:
-        print(f"Error fetching prices from new account to build map: {e}")
+        print(f"Error fetching prices from target account to build map: {e}")
         print("Cannot proceed without price mapping.")
         return  # Exit if map cannot be built
     # --- End build price mapping ---
 
     try:
-        subscriptions = old_stripe.subscriptions.list(
+        subscriptions = source_stripe.subscriptions.list(
             params={"status": "active", "limit": 100}
         )
         print(
-            f"Found {len(subscriptions.data)} active subscription(s) in the old account."
+            f"Found {len(subscriptions.data)} active subscription(s) in the source account."
         )
-        # Loop through each subscription and recreate it in the new account
+        # Loop through each subscription and recreate it in the target account
         for subscription in subscriptions.auto_paging_iter():
             # print(subscription) # Uncomment for detailed subscription info
-            new_subscription = recreate_subscription(
+            target_subscription = recreate_subscription(
                 subscription, price_mapping, dry_run  # Pass the map
             )
-            if new_subscription:
+            if target_subscription:
                 print(
-                    f"Recreated subscription {new_subscription['id']} for customer {new_subscription['customer']}"
+                    f"Recreated subscription {target_subscription['id']} for customer {target_subscription['customer']}"
                 )
                 # TODO: Add robust testing before enabling cancellation.
                 # Consider potential race conditions or failures during migration.
                 # if not dry_run:
                 #     try:
-                #         old_stripe.Subscription.delete(subscription['id'])
-                #         print(f"Cancelled old subscription {subscription['id']}")
+                #         source_stripe.Subscription.delete(subscription['id'])
+                #         print(f"Cancelled source subscription {subscription['id']}")
                 #     except stripe.error.StripeError as e:
-                #         print(f"Error cancelling old subscription {subscription['id']}: {e}")
+                #         print(f"Error cancelling source subscription {subscription['id']}: {e}")
             else:
                 print(
                     f"Skipped or failed recreating subscription {subscription.id} (Dry Run: {dry_run})"
@@ -183,7 +183,7 @@ def migrate_subscriptions(dry_run: bool = True) -> None:
 
         print(f"\nSubscription migration process completed (Dry Run: {dry_run}).")
     except stripe.error.StripeError as e:
-        print(f"Error fetching subscriptions from old account: {e}")
+        print(f"Error fetching subscriptions from source account: {e}")
 
 
 def main() -> None:
