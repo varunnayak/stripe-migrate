@@ -1,4 +1,3 @@
-import json
 import os
 from typing import Any, Dict, List, Optional
 
@@ -6,20 +5,12 @@ import stripe
 
 API_KEY_OLD: Optional[str] = os.getenv("API_KEY_OLD")
 API_KEY_NEW: Optional[str] = os.getenv("API_KEY_NEW")
-PRICE_MAPPING_JSON: str = os.getenv("PRICE_MAPPING_JSON", "{}")
 
 # Ensure API keys are set
 if not API_KEY_OLD:
     raise ValueError("API_KEY_OLD environment variable not set.")
 if not API_KEY_NEW:
     raise ValueError("API_KEY_NEW environment variable not set.")
-
-
-try:
-    price_mapping: Dict[str, str] = json.loads(PRICE_MAPPING_JSON)
-except json.JSONDecodeError:
-    print("Error: Invalid JSON format for PRICE_MAPPING_JSON.")
-    price_mapping = {}
 
 
 def get_stripe_client(api_key: str) -> Any:
@@ -38,13 +29,16 @@ def get_stripe_client(api_key: str) -> Any:
 
 # Function to recreate a subscription in the new account
 def recreate_subscription(
-    subscription: Dict[str, Any], dry_run: bool = True
+    subscription: Dict[str, Any],
+    price_mapping: Dict[str, str],  # Added price_mapping argument
+    dry_run: bool = True,
 ) -> Optional[Dict[str, Any]]:
     """
     Recreates a given subscription in the new Stripe account.
 
     Args:
         subscription: The subscription object from the old Stripe account.
+        price_mapping: A dictionary mapping old price IDs to new price IDs.
         dry_run: If True, simulates the process without creating the subscription.
 
     Returns:
@@ -52,7 +46,9 @@ def recreate_subscription(
         skipped or in dry_run mode.
     """
     if not price_mapping:
-        print("Error: Price mapping is empty. Cannot proceed.")
+        print(
+            "Error: Price mapping is empty or could not be generated. Cannot proceed."
+        )
         return None
 
     customer_id: str = subscription["customer"]
@@ -117,17 +113,43 @@ def recreate_subscription(
 def migrate_subscriptions(dry_run: bool = True) -> None:
     """
     Fetches all active subscriptions from the old Stripe account and attempts
-    to recreate them in the new Stripe account.
+    to recreate them in the new Stripe account. Dynamically builds price mapping.
     """
     print(f"Starting subscription migration (dry_run={dry_run})...")
     old_stripe = get_stripe_client(API_KEY_OLD)  # type: ignore
+    new_stripe = get_stripe_client(API_KEY_NEW)  # type: ignore # Initialize new client here
+
+    # --- Build price mapping dynamically ---
+    print("Building price map from new account metadata...")
+    price_mapping: Dict[str, str] = {}
+    try:
+        prices = new_stripe.Price.list(limit=100, active=True)  # Fetch active prices
+        for price in prices.auto_paging_iter():
+            if price.metadata and "old_price_id" in price.metadata:
+                old_id = price.metadata["old_price_id"]
+                price_mapping[old_id] = price.id
+                # Optional: print mapping for verification
+                # print(f"  Mapped old price {old_id} -> new price {price.id}")
+        print(f"Price map built successfully. Found {len(price_mapping)} mappings.")
+        if not price_mapping:
+            print(
+                "Warning: Price map is empty. Ensure products/prices were migrated correctly with 'old_price_id' in metadata."
+            )
+
+    except stripe.error.StripeError as e:
+        print(f"Error fetching prices from new account to build map: {e}")
+        print("Cannot proceed without price mapping.")
+        return  # Exit if map cannot be built
+    # --- End build price mapping ---
 
     try:
         subscriptions = old_stripe.Subscription.list(status="active", limit=100)
         # Loop through each subscription and recreate it in the new account
         for subscription in subscriptions.auto_paging_iter():
             # print(subscription) # Uncomment for detailed subscription info
-            new_subscription = recreate_subscription(subscription, dry_run)
+            new_subscription = recreate_subscription(
+                subscription, price_mapping, dry_run  # Pass the map
+            )
             if new_subscription:
                 print(
                     f"Recreated subscription {new_subscription['id']} for customer {new_subscription['customer']}"

@@ -46,17 +46,18 @@ def create_product_and_prices(
         A dictionary mapping old price IDs to new price IDs for this product,
         or None if product creation failed.
     """
-    product_id = product["id"]
-    print(f"\nProcessing product: {product['name']} ({product_id})")
+    product_id = product.id
+    print(f"\nProcessing product: {product.name} ({product_id})")
 
     try:
         # Create the product in the new account
         new_product = new_stripe.Product.create(
-            id=product_id,  # Use the same ID
-            name=product["name"],
-            description=product.get("description"),
+            name=product.name,
             active=product.get("active", True),
-            # Add other relevant fields if needed, e.g., metadata, attributes
+            description=product.get("description"),
+            id=product_id,  # Use the same ID
+            metadata=(product.metadata.to_dict_recursive() if product.metadata else {}),
+            tax_code=product.get("tax_code"),
         )
         print(f"  Created new product: {new_product.id}")
     except stripe.error.InvalidRequestError as e:
@@ -82,19 +83,24 @@ def create_product_and_prices(
         for price in prices.auto_paging_iter():
             print(f"    Processing price: {price.id}")
             try:
-                recurring_data = price.get("recurring")
                 new_price = new_stripe.Price.create(
-                    id=price.id,  # Use the same ID if desired, but ensure it's unique or handle errors
-                    product=product_id,
-                    unit_amount=price.unit_amount,
                     currency=price.currency,
-                    recurring=recurring_data,
                     active=price.active,
-                    # Preserve metadata if needed, potentially adding the old ID
-                    metadata=(
-                        price.metadata.to_dict_recursive() if price.metadata else {}
-                    ),
-                    # Consider other fields: billing_scheme, tiers, tiers_mode, lookup_key
+                    metadata={
+                        **(
+                            price.metadata.to_dict_recursive() if price.metadata else {}
+                        ),
+                        "old_price_id": price.id,  # Add reference to the old price ID
+                    },
+                    nickname=price.get("nickname"),
+                    product=product_id,
+                    recurring=price.get("recurring"),
+                    tax_behavior=price.get("tax_behavior"),
+                    unit_amount=price.get("unit_amount"),
+                    billing_scheme=price.billing_scheme,
+                    tiers=price.get("tiers"),
+                    tiers_mode=price.get("tiers_mode"),
+                    transform_quantity=price.get("transform_quantity"),
                 )
                 print(f"      Created new price: {new_price.id}")
                 price_map[price.id] = new_price.id
@@ -189,20 +195,20 @@ def migrate_coupons() -> None:
                 print(f"  Processing coupon: {coupon.name or coupon.id}")
                 try:
                     new_coupon = new_stripe.Coupon.create(
-                        id=coupon.id,  # Use the same ID
-                        amount_off=coupon.amount_off,
-                        currency=coupon.currency,
+                        amount_off=coupon.get("amount_off"),
+                        currency=coupon.get("currency"),
                         duration=coupon.duration,
-                        duration_in_months=coupon.duration_in_months,
-                        max_redemptions=coupon.max_redemptions,
                         metadata=(
                             coupon.metadata.to_dict_recursive()
                             if coupon.metadata
                             else {}
                         ),
-                        name=coupon.name,
-                        percent_off=coupon.percent_off,
-                        # Add other fields if needed: applies_to, currency_options, etc.
+                        name=coupon.get("name"),
+                        percent_off=coupon.get("percent_off"),
+                        duration_in_months=coupon.get("duration_in_months"),
+                        id=coupon.id,  # Use the same ID
+                        max_redemptions=coupon.get("max_redemptions"),
+                        redeem_by=coupon.get("redeem_by"),
                     )
                     print(f"    Migrated coupon: {new_coupon.id}")
                     migrated_count += 1
@@ -256,18 +262,20 @@ def migrate_promocodes() -> None:
                         continue  # Skip this promo code if coupon doesn't exist
 
                     new_promo_code = new_stripe.PromotionCode.create(
-                        id=promo_code.id,  # Use the same ID
                         coupon=promo_code.coupon.id,
                         code=promo_code.code,
+                        metadata={
+                            **(
+                                promo_code.metadata.to_dict_recursive()
+                                if promo_code.metadata
+                                else {}
+                            ),
+                            "old_promotion_code_id": promo_code.id,  # Add reference to the old promo_code ID
+                        },
                         active=promo_code.active,
-                        customer=promo_code.customer,  # Might need mapping if customer IDs change
-                        expires_at=promo_code.expires_at,
-                        max_redemptions=promo_code.max_redemptions,
-                        metadata=(
-                            promo_code.metadata.to_dict_recursive()
-                            if promo_code.metadata
-                            else {}
-                        ),
+                        customer=promo_code.get("customer"),
+                        expires_at=promo_code.get("expires_at"),
+                        max_redemptions=promo_code.get("max_redemptions"),
                         restrictions=(
                             promo_code.restrictions.to_dict_recursive()
                             if promo_code.restrictions
