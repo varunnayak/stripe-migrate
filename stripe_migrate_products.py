@@ -183,38 +183,68 @@ def create_product_and_prices(
 
             else:  # Actual creation logic
                 try:
-                    target_price = target_stripe.prices.create(
-                        params={
-                            "currency": price.currency,
-                            "active": price.active,
-                            "metadata": {
-                                **(
-                                    price.metadata.to_dict_recursive()
-                                    if price.metadata
-                                    else {}
-                                ),
-                                "source_price_id": source_price_id,
-                            },
-                            "nickname": price.get("nickname"),
-                            "product": target_product_id,
-                            "recurring": price.get("recurring"),
-                            "tax_behavior": price.get("tax_behavior"),
-                            "unit_amount": price.get("unit_amount"),
-                            "billing_scheme": price.billing_scheme,
-                            "tiers": price.get("tiers"),
-                            "tiers_mode": price.get("tiers_mode"),
-                            "transform_quantity": price.get("transform_quantity"),
-                        }
-                    )
-                    print(
-                        f"      Created target price: {target_price.id} (linked to source: {source_price_id})"
-                    )
-                    price_map[source_price_id] = target_price.id
+                    # Check if a price with the same source_price_id metadata already exists
+                    existing_target_price = None
+                    try:
+                        target_prices = target_stripe.prices.list(
+                            params={
+                                "product": target_product_id,
+                                "active": True,
+                                "limit": 100,
+                            }
+                        )
+                        for p in target_prices.auto_paging_iter():
+                            if (
+                                p.metadata
+                                and p.metadata.get("source_price_id") == source_price_id
+                            ):
+                                existing_target_price = p
+                                break
+                    except stripe.error.StripeError as list_err:
+                        print(
+                            f"      Warning: Could not list target prices for product {target_product_id} to check existence: {list_err}"
+                        )
+                        # Continue to attempt creation, relying on creation errors
+
+                    if existing_target_price:
+                        print(
+                            f"      Target price linked to source {source_price_id} already exists: {existing_target_price.id}"
+                        )
+                        price_map[source_price_id] = existing_target_price.id
+                    else:
+                        # Create the price if it doesn't exist
+                        target_price = target_stripe.prices.create(
+                            params={
+                                "currency": price.currency,
+                                "active": price.active,
+                                "metadata": {
+                                    **(
+                                        price.metadata.to_dict_recursive()
+                                        if price.metadata
+                                        else {}
+                                    ),
+                                    "source_price_id": source_price_id,
+                                },
+                                "nickname": price.get("nickname"),
+                                "product": target_product_id,
+                                "recurring": price.get("recurring"),
+                                "tax_behavior": price.get("tax_behavior"),
+                                "unit_amount": price.get("unit_amount"),
+                                "billing_scheme": price.billing_scheme,
+                                "tiers": price.get("tiers"),
+                                "tiers_mode": price.get("tiers_mode"),
+                                "transform_quantity": price.get("transform_quantity"),
+                            }
+                        )
+                        print(
+                            f"      Created target price: {target_price.id} (linked to source: {source_price_id})"
+                        )
+                        price_map[source_price_id] = target_price.id
                 except stripe.error.InvalidRequestError as e:
                     # Price creation doesn't usually throw 'resource_already_exists' like products
                     # If a price with identical parameters under the target product exists,
                     # Stripe might create it anyway or error differently.
-                    # Handling relies more on the 'source_price_id' metadata for mapping.
+                    # The check above using metadata is more reliable.
                     print(
                         f"      Error creating price (linked to source: {source_price_id}) for product {target_product_id}: {e}"
                     )
@@ -383,36 +413,45 @@ def migrate_promocodes(dry_run: bool = True) -> None:
                     skipped_count += 1
                     continue  # Skip this promo code if coupon doesn't exist
 
+                # Check if promo code with the same code already exists in target
+                existing_promo_code = None
+                try:
+                    existing_codes = target_stripe.promotion_codes.list(
+                        params={"code": promo_code_code, "active": True, "limit": 1}
+                    )
+                    if existing_codes and existing_codes.data:
+                        existing_promo_code = existing_codes.data[0]
+                except stripe.error.StripeError as list_err:
+                    print(
+                        f"    Warning: Could not list target promo codes to check existence for {promo_code_code}: {list_err}"
+                    )
+                    # Decide how to proceed: skip or attempt creation?
+                    # For safety, let's skip if the check fails, unless it's a dry run
+                    if not dry_run:
+                        skipped_count += 1
+                        continue
+                    # In dry run, we can note the check failed but continue simulation
+                    print(
+                        f"    [Dry Run] Check failed, assuming {promo_code_code} doesn't exist for simulation."
+                    )
+
+                if existing_promo_code:
+                    print(
+                        f"    Skipping promocode {promo_code_code}: Active code already exists in target account (ID: {existing_promo_code.id})."
+                    )
+                    skipped_count += 1
+                    continue
+
                 # Dry run simulation or actual creation
                 if dry_run:
+                    # We already established it doesn't exist (or check failed) in the block above
                     print(
                         f"    [Dry Run] Would create promotion code: {promo_code_code} for coupon {coupon_id}"
                     )
-                    # Check if promo code exists
-                    try:
-                        # Promo codes are often retrieved by code, but API might need ID.
-                        # We'll check existence conceptually. A list operation might be needed
-                        # for a perfect check, but let's keep it simple.
-                        # Attempt retrieve by ID (less likely to work for promo codes vs coupons/products)
-                        # Or maybe list and filter by code? Let's assume check means "would attempt create".
-                        print(
-                            f"    [Dry Run] Checking if promo code {promo_code_code} exists..."
-                        )
-                        # Simulate check - assume it doesn't exist unless an obvious error occurs
-                        # A real check might involve listing codes: codes = target_stripe.PromotionCode.list(code=promo_code_code)
-                        print(
-                            f"    [Dry Run] Promo code {promo_code_code} assumed not to exist yet."
-                        )
-                        migrated_count += 1  # Count as would-be migrated
-                    except stripe.error.StripeError as e:
-                        # This block might not be reached with the simplified check above
-                        print(
-                            f"    [Dry Run] Error checking for promo code {promo_code_code}: {e}"
-                        )
-                        skipped_count += 1
+                    migrated_count += 1
                     continue  # Skip actual creation
 
-                # Actual creation logic (only runs if not dry_run)
+                # Actual creation logic (only runs if not dry_run and code doesn't exist)
                 try:
                     target_promo_code = target_stripe.promotion_codes.create(
                         params={
@@ -426,7 +465,7 @@ def migrate_promocodes(dry_run: bool = True) -> None:
                                 ),
                                 "source_promotion_code_id": promo_code_id,
                             },
-                            "active": promo_code.active,
+                            "active": promo_code.active,  # Should always be true based on outer check
                             "customer": promo_code.get("customer"),
                             "expires_at": promo_code.get("expires_at"),
                             "max_redemptions": promo_code.get("max_redemptions"),
@@ -437,19 +476,15 @@ def migrate_promocodes(dry_run: bool = True) -> None:
                             ),
                         }
                     )
-                    print(f"    Migrated promotion code: {target_promo_code.id}")
+                    print(
+                        f"    Migrated promotion code: {target_promo_code.code} (ID: {target_promo_code.id})"
+                    )
                     migrated_count += 1
                 except stripe.error.InvalidRequestError as e:
-                    if "resource_already_exists" in str(e):
-                        print(
-                            f"    Promotion code {promo_code_code} already exists. Skipping creation."
-                        )
-                        skipped_count += 1
-                    else:
-                        print(
-                            f"    Error migrating promotion code {promo_code_code}: {e}"
-                        )
-                        skipped_count += 1
+                    # This might still catch race conditions or other creation issues
+                    # but the primary existence check is now done above.
+                    print(f"    Error migrating promotion code {promo_code_code}: {e}")
+                    skipped_count += 1
                 except stripe.error.StripeError as e:
                     print(f"    Error migrating promotion code {promo_code_code}: {e}")
                     skipped_count += 1
