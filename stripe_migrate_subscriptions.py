@@ -45,6 +45,112 @@ STATUS_FAILED = "failed"
 STATUS_DRY_RUN = "dry_run"
 
 
+# Helper function to ensure a default payment method exists for the customer in the target account
+def _ensure_payment_method(
+    customer_id: str, target_stripe: Any, source_stripe: Any
+) -> Optional[str]:
+    """
+    Checks for and sets up a default payment method for a customer in the target account.
+
+    1. Checks if the target customer already has a default payment method.
+    2. If not, checks the source customer for a suitable payment method (card).
+    3. If found in source, attempts to attach it to the target customer and set it as default.
+
+    Args:
+        customer_id: The Stripe Customer ID.
+        target_stripe: Initialized Stripe client for the target account.
+        source_stripe: Initialized Stripe client for the source account.
+
+    Returns:
+        The ID of the default payment method in the target account, or None if setup failed.
+    """
+    payment_method_id: Optional[str] = None
+    try:
+        # 1. Check target account first
+        logging.debug(
+            "  Ensuring PM: Checking target customer %s for default PM...", customer_id
+        )
+        target_customer = target_stripe.customers.retrieve(
+            customer_id, expand=["invoice_settings.default_payment_method"]
+        )
+        if (
+            target_customer.invoice_settings
+            and target_customer.invoice_settings.default_payment_method
+        ):
+            payment_method_id = (
+                target_customer.invoice_settings.default_payment_method.id
+            )
+            logging.info(
+                "  Ensuring PM: Found existing default payment method in target: %s",
+                payment_method_id,
+            )
+            return payment_method_id
+        else:
+            # 2. If no default PM in target, check source
+            logging.info(
+                "  Ensuring PM: No default PM in target, checking source account..."
+            )
+            source_pms = source_stripe.payment_methods.list(
+                params={"customer": customer_id, "type": "card", "limit": 1}
+            )
+            if source_pms.data:
+                source_pm_id = source_pms.data[0].id
+                logging.info(
+                    "  Ensuring PM: Found source PM: %s. Attaching to target...",
+                    source_pm_id,
+                )
+                try:
+                    # 3. Attach source PM to target customer
+                    attached_pm = target_stripe.payment_methods.attach(
+                        source_pm_id, params={"customer": customer_id}
+                    )
+                    payment_method_id = attached_pm.id
+                    # Set as default for customer
+                    logging.debug(
+                        "  Ensuring PM: Setting %s as default PM for target customer %s...",
+                        payment_method_id,
+                        customer_id,
+                    )
+                    target_stripe.customers.update(
+                        customer_id,
+                        params={
+                            "invoice_settings": {
+                                "default_payment_method": payment_method_id
+                            }
+                        },
+                    )
+                    logging.info(
+                        "  Ensuring PM: Successfully attached and set source PM as default in target: %s",
+                        payment_method_id,
+                    )
+                    return payment_method_id
+                except stripe.error.StripeError as attach_err:
+                    logging.error(
+                        "  Ensuring PM: Error attaching source PM %s to target customer %s: %s",
+                        source_pm_id,
+                        customer_id,
+                        attach_err,
+                    )
+                    # Log warning here, but failure is handled by returning None
+                    logging.warning(
+                        "  Subscription creation might fail due to payment method attachment issue."
+                    )
+                    return None
+            else:
+                logging.warning(
+                    "  Ensuring PM: No suitable card payment methods found for customer %s in source account.",
+                    customer_id,
+                )
+                return None  # Cannot proceed without a PM
+    except stripe.error.StripeError as e:
+        logging.error(
+            "  Ensuring PM: Error checking/attaching payment methods for customer %s: %s",
+            customer_id,
+            e,
+        )
+        return None
+
+
 # Function to recreate a subscription in the target account
 def recreate_subscription(
     subscription: Dict[str, Any],
@@ -53,7 +159,7 @@ def recreate_subscription(
     target_stripe: Any,
     source_stripe: Any,
     dry_run: bool = True,
-) -> Tuple[str, Optional[str]]:  # Return status and subscription ID (or None)
+) -> str:  # Return only status
     """
     Recreates a given subscription in the target Stripe account, using pre-fetched data
     to check for existing subscriptions.
@@ -68,8 +174,7 @@ def recreate_subscription(
         dry_run: If True, simulates the process without creating the subscription.
 
     Returns:
-        A tuple containing the status (created, skipped, failed, dry_run)
-        and the target subscription ID if created, otherwise None.
+        A status string indicating the result of the operation.
     """
     source_subscription_id = subscription.id
     customer_id: str = subscription["customer"]
@@ -84,7 +189,7 @@ def recreate_subscription(
             "  Error: Price mapping is empty. Skipping source subscription %s.",
             source_subscription_id,
         )
-        return STATUS_FAILED, None
+        return STATUS_FAILED
 
     # Map source price IDs to target price IDs for this subscription
     target_items: List[Dict[str, str]] = []
@@ -106,7 +211,7 @@ def recreate_subscription(
             break  # Stop processing items for this subscription
 
     if has_mapping_error:
-        return STATUS_FAILED, None
+        return STATUS_FAILED
 
     logging.debug("  Mapped target items: %s", target_items)
 
@@ -121,37 +226,8 @@ def recreate_subscription(
                 "  Skipping: Customer %s already has an active subscription with the same price IDs (based on pre-fetched list).",
                 customer_id,
             )
-            # Cannot easily get the existing sub ID from this structure, return None for ID
-            return STATUS_SKIPPED, None
-    # Removed old check block that used API call
-    # try:
-    #     logging.debug(
-    #         "  Checking for existing active subscriptions for customer %s...",
-    #         customer_id,
-    #     )
-    #     existing_target_subscriptions = target_stripe.subscriptions.list(
-    #         params={"customer": customer_id, "status": "active", "limit": 100}
-    #     )
-    #     for existing_sub in existing_target_subscriptions.auto_paging_iter():
-    #         existing_sub_price_ids = {item.price.id for item in existing_sub.items.data}
-    #         if existing_sub_price_ids == target_price_ids_set:
-    #             logging.info(
-    #                 "  Skipping: Found existing active subscription %s for customer %s with the same price IDs.",
-    #                 existing_sub.id,
-    #                 customer_id,
-    #             )
-    #             return (
-    #                 STATUS_SKIPPED,
-    #                 existing_sub.id,
-    #             )  # Return skipped status and existing ID
-    # except stripe.error.StripeError as list_err:
-    #     logging.warning(
-    #         "  Warning: Could not list target subscriptions for customer %s to check for duplicates: %s",
-    #         customer_id,
-    #         list_err,
-    #     )
-    # Decide whether to proceed or stop if check fails.
-    # For now, let's proceed but log the warning. A stricter approach might return STATUS_FAILED.
+            # Cannot easily get the existing sub ID from this structure
+            return STATUS_SKIPPED
 
     # --- Dry Run Simulation ---
     if dry_run:
@@ -167,107 +243,21 @@ def recreate_subscription(
             "    Metadata: {'source_subscription_id': '%s'}", source_subscription_id
         )
         logging.info("  [Dry Run] Subscription creation skipped.")
-        return STATUS_DRY_RUN, None
+        return STATUS_DRY_RUN
 
-    # --- Fetch/Attach Payment Method (only needed for live run) ---
-    payment_method_id: Optional[str] = None
-    try:
-        # Check target account first for existing default PM
-        logging.debug(
-            "  Fetching target customer %s to check default PM...", customer_id
-        )
-        target_customer = target_stripe.customers.retrieve(
-            customer_id, expand=["invoice_settings.default_payment_method"]
-        )
-        if (
-            target_customer.invoice_settings
-            and target_customer.invoice_settings.default_payment_method
-        ):
-            payment_method_id = (
-                target_customer.invoice_settings.default_payment_method.id
-            )
-            logging.info(
-                "  Found default payment method in target account: %s",
-                payment_method_id,
-            )
-        else:
-            # If no default PM in target, check source PMs and attach if found
-            logging.info(
-                "  No default payment method found in target, checking source..."
-            )
-            source_pms = source_stripe.payment_methods.list(
-                params={
-                    "customer": customer_id,
-                    "type": "card",
-                    "limit": 1,
-                }  # Assuming card PM is desired
-            )
-            if source_pms.data:
-                source_pm_id = source_pms.data[0].id
-                logging.info(
-                    "  Found payment method in source: %s. Attaching to target customer...",
-                    source_pm_id,
-                )
-                try:
-                    # Attach the source PM to the target customer
-                    # Note: This might fail depending on Stripe setup (e.g., cross-account PM usage requires specific permissions)
-                    # Using PaymentIntents/SetupIntents is generally more robust for capturing payment details directly in the target account.
-                    attached_pm = target_stripe.payment_methods.attach(
-                        source_pm_id, params={"customer": customer_id}
-                    )
-                    payment_method_id = attached_pm.id
-                    # Set as default for customer (important for subscriptions)
-                    logging.debug(
-                        "  Setting %s as default PM for customer %s...",
-                        payment_method_id,
-                        customer_id,
-                    )
-                    target_stripe.customers.update(
-                        customer_id,
-                        params={
-                            "invoice_settings": {
-                                "default_payment_method": payment_method_id
-                            }
-                        },
-                    )
-                    logging.info(
-                        "  Successfully attached and set as default PM in target: %s",
-                        payment_method_id,
-                    )
-                except stripe.error.StripeError as attach_err:
-                    logging.error(
-                        "  Error attaching source PM %s to target customer %s: %s",
-                        source_pm_id,
-                        customer_id,
-                        attach_err,
-                    )
-                    logging.warning(
-                        "  Skipping subscription %s due to payment method attachment issue.",
-                        source_subscription_id,
-                    )
-                    return STATUS_FAILED, None
-            else:
-                logging.warning(
-                    "  No suitable card payment methods found for customer %s in source account. Subscription requires a payment method. Skipping %s.",
-                    customer_id,
-                    source_subscription_id,
-                )
-                return STATUS_FAILED, None  # Cannot create subscription without PM
-    except stripe.error.StripeError as e:
-        logging.error(
-            "  Error fetching/attaching payment methods for customer %s: %s",
-            customer_id,
-            e,
-        )
-        return STATUS_FAILED, None
+    # --- Fetch/Attach Payment Method (using helper function) ---
+    payment_method_id = _ensure_payment_method(
+        customer_id, target_stripe, source_stripe
+    )
 
     # Ensure we have a payment method ID before proceeding
     if not payment_method_id:
         logging.error(
-            "  Cannot create subscription %s: No payment method ID was determined.",
+            "  Failed to ensure payment method for customer %s. Cannot create subscription %s.",
+            customer_id,
             source_subscription_id,
         )
-        return STATUS_FAILED, None
+        return STATUS_FAILED
 
     # --- Create the subscription in the target account ---
     try:
@@ -299,7 +289,7 @@ def recreate_subscription(
             target_subscription.id,
             source_subscription_id,
         )
-        return STATUS_CREATED, target_subscription.id
+        return STATUS_CREATED
     except stripe.error.StripeError as e:
         logging.error(
             "  Error creating subscription for source %s (customer %s): %s",
@@ -307,7 +297,7 @@ def recreate_subscription(
             customer_id,
             e,
         )
-        return STATUS_FAILED, None
+        return STATUS_FAILED
 
 
 def migrate_subscriptions(dry_run: bool = True) -> None:
@@ -391,7 +381,7 @@ def migrate_subscriptions(dry_run: bool = True) -> None:
 
         # Loop through each subscription and recreate it in the target account
         for subscription in subs_list:
-            status, target_sub_id = recreate_subscription(
+            status = recreate_subscription(
                 subscription,
                 price_mapping,
                 existing_target_subs_by_customer,  # Pass pre-fetched data
@@ -402,15 +392,6 @@ def migrate_subscriptions(dry_run: bool = True) -> None:
 
             if status == STATUS_CREATED:
                 created_count += 1
-                # TODO: Implement source subscription cancellation logic HERE if desired
-                # Be cautious about doing this automatically. Might be better as a separate step/script.
-                # source_sub_id = subscription.id
-                # logging.info(f"  -> Successfully created target sub {target_sub_id}. Now cancelling source sub {source_sub_id}...")
-                # try:
-                #     source_stripe.subscriptions.cancel(source_sub_id)
-                #     logging.info(f"      Cancelled source subscription {source_sub_id}.")
-                # except stripe.error.StripeError as cancel_err:
-                #     logging.error(f"      Error cancelling source subscription {source_sub_id}: {cancel_err}")
             elif status == STATUS_SKIPPED:
                 skipped_count += 1
             elif status == STATUS_FAILED:

@@ -1,9 +1,10 @@
 import os
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Set
 
 import stripe
 from dotenv import load_dotenv
+from stripe import StripeClient
 
 # Configure logging
 logging.basicConfig(
@@ -25,7 +26,7 @@ if not API_KEY_TARGET:
     raise ValueError("API_KEY_TARGET environment variable not set.")
 
 
-def get_stripe_client(api_key: str) -> Any:
+def get_stripe_client(api_key: str) -> StripeClient:
     """
     Returns a Stripe client initialized with the given API key.
 
@@ -38,14 +39,153 @@ def get_stripe_client(api_key: str) -> Any:
     return stripe.StripeClient(api_key=api_key)
 
 
+# Helper function to find/create target price
+def _find_or_create_target_price(
+    source_price: Dict[str, Any],
+    target_product_id: str,
+    target_stripe: StripeClient,
+    dry_run: bool,
+) -> Optional[str]:
+    """
+    Checks if a target price corresponding to the source price exists,
+    otherwise creates it (or simulates creation in dry run).
+
+    Checks first by 'source_price_id' metadata, then attempts creation.
+    Returns the target price ID if found or created, None if creation failed or skipped.
+    """
+    source_price_id = source_price.id
+    target_price_id = None  # Default to None
+
+    # 1. Check if price linked by metadata exists
+    existing_target_price_meta = None
+    try:
+        target_prices = target_stripe.prices.list(
+            params={
+                "product": target_product_id,
+                "active": True,  # Only check active prices
+                "limit": 100,
+            }
+        )
+        for p in target_prices.auto_paging_iter():
+            if p.metadata and p.metadata.get("source_price_id") == source_price_id:
+                existing_target_price_meta = p
+                break
+    except stripe.error.StripeError as list_err:
+        logging.warning(
+            "      Warning: Could not list target prices for product %s to check existence by metadata: %s",
+            target_product_id,
+            list_err,
+        )
+        # Proceed, creation attempt might still work/fail appropriately
+
+    if existing_target_price_meta:
+        target_price_id = existing_target_price_meta.id
+        log_prefix = "[Dry Run] " if dry_run else ""
+        logging.info(
+            "      %sPrice linked via metadata %s already exists: %s. Using existing.",
+            log_prefix,
+            source_price_id,
+            target_price_id,
+        )
+        return target_price_id  # Found by metadata, return ID
+
+    # 2. If not found by metadata, simulate or attempt creation
+    if dry_run:
+        logging.info(
+            "      [Dry Run] Price linked via metadata %s not found.", source_price_id
+        )
+        # Optional: Add check by ID for dry run logging (less reliable)
+        try:
+            target_stripe.prices.retrieve(source_price_id)
+            logging.info(
+                "      [Dry Run] Price %s might exist by ID (less reliable check), but not linked by metadata.",
+                source_price_id,
+            )
+        except stripe.error.InvalidRequestError as e_inner:
+            if "No such price" in str(e_inner):
+                logging.info(
+                    "      [Dry Run] Price %s does not exist by ID either.",
+                    source_price_id,
+                )
+            else:
+                logging.warning(
+                    "      [Dry Run] Error checking for existing price %s by ID: %s",
+                    source_price_id,
+                    e_inner,
+                )
+        except stripe.error.StripeError as e_inner:
+            logging.error(
+                "      [Dry Run] Stripe error checking for existing price %s by ID: %s",
+                source_price_id,
+                e_inner,
+            )
+
+        logging.info(
+            "      [Dry Run] Would attempt to create price for product %s (linked to source %s)",
+            target_product_id,
+            source_price_id,
+        )
+        # Return None in dry run if not found, as no ID is generated/mapped
+        return None
+
+    else:  # Actual creation logic
+        logging.info(
+            "      Target price linked to source %s not found by metadata. Creating.",
+            source_price_id,
+        )
+        try:
+            # Prepare parameters
+            price_params = {
+                "currency": source_price.currency,
+                "active": source_price.active,
+                "metadata": {
+                    **(
+                        source_price.metadata.to_dict_recursive()
+                        if source_price.metadata
+                        else {}
+                    ),
+                    "source_price_id": source_price_id,
+                },
+                "nickname": source_price.get("nickname"),
+                "product": target_product_id,
+                "recurring": source_price.get("recurring"),
+                "tax_behavior": source_price.get("tax_behavior"),
+                "unit_amount": source_price.get("unit_amount"),
+                "billing_scheme": source_price.billing_scheme,
+                "tiers": source_price.get("tiers"),
+                "tiers_mode": source_price.get("tiers_mode"),
+                "transform_quantity": source_price.get("transform_quantity"),
+                "custom_unit_amount": source_price.get("custom_unit_amount"),
+            }
+            price_params = {k: v for k, v in price_params.items() if v is not None}
+
+            logging.debug("      Creating price with params: %s", price_params)
+            target_price = target_stripe.prices.create(params=price_params)
+            target_price_id = target_price.id
+            logging.info(
+                "      Created target price: %s (linked to source: %s)",
+                target_price_id,
+                source_price_id,
+            )
+            return target_price_id
+        except stripe.error.StripeError as e:
+            logging.error(
+                "      Error creating price (linked to source: %s) for product %s: %s",
+                source_price_id,
+                target_product_id,
+                e,
+            )
+            return None  # Creation failed
+
+
 # Function to create products and prices in the target account
 def create_product_and_prices(
     product: Dict[str, Any],
-    source_stripe: Any,
-    target_stripe: Any,
-    existing_target_product_ids: set[str],
+    source_stripe: StripeClient,
+    target_stripe: StripeClient,
+    existing_target_product_ids: Set[str],
     dry_run: bool = True,
-) -> Optional[Dict[str, str]]:
+) -> bool:
     """
     Creates a product and its associated active prices from the source account
     in the target Stripe account, utilizing a pre-fetched set of existing target IDs.
@@ -58,19 +198,20 @@ def create_product_and_prices(
         dry_run: If True, simulates the process without creating resources.
 
     Returns:
-        A dictionary mapping source price IDs to target price IDs for this product,
-        or None if product creation failed (or skipped in dry run).
+        True if the product and its prices were processed successfully (or simulated),
+        False if product creation failed or fetching source prices failed.
     """
     product_id = product.id
     logging.info("Processing product: %s (%s)", product.name, product_id)
 
     target_product_id = product_id
+    target_product = None  # Initialize target_product
 
+    # --- Product Handling (Dry Run / Live) ---
     if dry_run:
         logging.info(
             "  [Dry Run] Would process product: %s (%s)", product.name, product_id
         )
-        # Use the passed set for the dry run check
         if product_id in existing_target_product_ids:
             logging.info(
                 "  [Dry Run] Product %s already exists in the target account (based on pre-fetched list).",
@@ -81,133 +222,26 @@ def create_product_and_prices(
                 "  [Dry Run] Product %s does not exist yet in the target account (based on pre-fetched list). Would create.",
                 product_id,
             )
-        # Simulate price check/creation as before, assuming product exists/would exist
-        # (Dry run price check logic remains largely the same, using retrieve on target)
-        price_map: Dict[str, str] = {}  # Initialize price_map for dry run
-        try:
-            # Fetch source prices for simulation
-            prices = source_stripe.prices.list(
-                params={"product": product_id, "active": True, "limit": 100}
-            )
-            logging.info(
-                "  [Dry Run] Found %d active price(s) for source product %s",
-                len(prices.data),
-                product_id,
-            )
-
-            for (
-                price
-            ) in (
-                prices.auto_paging_iter()
-            ):  # Iterate through SOURCE prices for simulation
-                source_price_id = price.id
-                logging.info("    [Dry Run] Simulating price: %s", source_price_id)
-                target_price_id_placeholder = f"target_{source_price_id}"
-
-                # Check if price exists in target account even in dry run
-                try:
-                    logging.info(
-                        "      [Dry Run] Checking if price similar to %s exists in target...",
-                        source_price_id,
-                    )
-                    # Check by metadata first for a more reliable check
-                    target_prices_dry = target_stripe.prices.list(
-                        params={
-                            "product": target_product_id,
-                            "active": True,
-                            "limit": 100,
-                        }
-                    )
-                    found_by_meta = False
-                    for p_dry in target_prices_dry.auto_paging_iter():
-                        if (
-                            p_dry.metadata
-                            and p_dry.metadata.get("source_price_id") == source_price_id
-                        ):
-                            logging.info(
-                                "      [Dry Run] Price linked via metadata %s already exists: %s",
-                                source_price_id,
-                                p_dry.id,
-                            )
-                            price_map[source_price_id] = p_dry.id
-                            found_by_meta = True
-                            break
-                    if not found_by_meta:
-                        # Fallback check by ID (less reliable, might match unrelated price)
-                        try:
-                            existing_price = target_stripe.prices.retrieve(
-                                source_price_id
-                            )
-                            logging.info(
-                                "      [Dry Run] Price %s might exist by ID (less reliable check).",
-                                source_price_id,
-                            )
-                            # Avoid mapping based on ID alone in dry run unless confirmed by metadata
-                            price_map[source_price_id] = target_price_id_placeholder
-                        except stripe.error.InvalidRequestError as e_inner:
-                            if "No such price" in str(e_inner):
-                                logging.info(
-                                    "      [Dry Run] Price %s does not exist by that ID.",
-                                    source_price_id,
-                                )
-                                price_map[source_price_id] = target_price_id_placeholder
-                            else:
-                                logging.warning(
-                                    "      [Dry Run] Error checking for existing price %s by ID: %s",
-                                    source_price_id,
-                                    e_inner,
-                                )
-                                price_map[source_price_id] = target_price_id_placeholder
-                        except stripe.error.StripeError as e_inner:
-                            logging.error(
-                                "      [Dry Run] Stripe error checking for existing price %s by ID: %s",
-                                source_price_id,
-                                e_inner,
-                            )
-                            price_map[source_price_id] = target_price_id_placeholder
-
-                except stripe.error.StripeError as e:
-                    logging.error(
-                        "      [Dry Run] Error listing target prices for check %s: %s",
-                        source_price_id,
-                        e,
-                    )
-                    price_map[source_price_id] = target_price_id_placeholder
-        except stripe.error.StripeError as e:
-            logging.error(
-                "  [Dry Run] Error fetching source prices for product %s: %s",
-                product_id,
-                e,
-            )
-        # --- End of dry run price check logic ---
+        # In dry run, proceed to price simulation regardless of product "existence"
     else:
         # Actual creation logic: Use the pre-fetched set
-        target_product = None
         product_exists = product_id in existing_target_product_ids
 
         if product_exists:
             logging.info(
-                "  Product %s exists in target account (based on pre-fetched list). Skipping retrieve/create.",
+                "  Product %s exists in target account (based on pre-fetched list). Skipping product creation.",
                 product_id,
             )
-            # We already have the target_product_id = product_id, no API call needed here.
-            # target_product variable remains None in this path
-            pass  # Explicitly do nothing here, proceed to price creation
-            # try:
-            #     target_product = target_stripe.products.retrieve(product_id)
-            #     target_product_id = target_product.id # Confirm ID from retrieved object
-            # except stripe.error.StripeError as e:
-            #     logging.error("  Error retrieving existing product %s: %s", product_id, e)
-            #     return None # Cannot proceed if retrieval fails
+            # We still need the target_product_id which is the same as product_id
+            # No API call needed here to retrieve the product object itself.
         else:
             logging.info(
                 "  Product %s does not exist in target account (based on pre-fetched list). Creating.",
                 product_id,
             )
             try:
-                # Explicitly list parameters for clarity
                 product_params = {
-                    "id": product_id,  # Use the same ID
+                    "id": product_id,
                     "name": product.name,
                     "active": product.get("active", True),
                     "description": product.get("description"),
@@ -218,220 +252,66 @@ def create_product_and_prices(
                 }
                 logging.debug("  Creating product with params: %s", product_params)
                 target_product = target_stripe.products.create(params=product_params)
-                target_product_id = target_product.id  # Get actual ID after creation
+                # Use the ID from the created product, though it should match product_id
+                target_product_id = target_product.id
                 logging.info("  Created target product: %s", target_product_id)
             except stripe.error.InvalidRequestError as create_err:
-                # Handle potential creation errors (e.g., race condition or list failure)
                 if "resource_already_exists" in str(create_err):
                     logging.warning(
-                        "  Product %s was created between list and attempt, or list failed. Re-fetching.",
+                        "  Product %s was created between list and attempt, or list failed. Assuming it exists.",
                         product_id,
                     )
-                    try:
-                        # Fetch the product again to be sure
-                        target_product = target_stripe.products.retrieve(product_id)
-                        target_product_id = target_product.id
-                    except stripe.error.StripeError as retrieve_err:
-                        logging.error(
-                            "  Failed to retrieve existing product %s after creation conflict: %s",
-                            product_id,
-                            retrieve_err,
-                        )
-                        return None  # Cannot proceed without the product
+                    # target_product_id remains product_id, continue to price creation
                 else:
                     logging.error(
                         "  Error creating product %s: %s", product_id, create_err
                     )
-                    return None
+                    return False  # Cannot proceed if product creation fails
             except stripe.error.StripeError as create_err:
                 logging.error("  Error creating product %s: %s", product_id, create_err)
-                return None
+                return False  # Cannot proceed if product creation fails
 
-    price_map: Dict[str, str] = {}
-    # Retrieve active prices for the product from the source account
+    # --- Price Handling (Dry Run / Live) ---
     try:
+        # Fetch active prices from the source account
         prices = source_stripe.prices.list(
             params={"product": product_id, "active": True, "limit": 100}
         )
         logging.info(
-            "  Found %d active price(s) for product %s", len(prices.data), product_id
+            "  Found %d active price(s) for source product %s",
+            len(prices.data),
+            product_id,
         )
 
-        # Create prices for the target product in the target account
+        # Process each source price using the helper function
         for price in prices.auto_paging_iter():
             source_price_id = price.id
-            logging.info("    Processing price: %s", source_price_id)
-            target_price_id_placeholder = f"target_{source_price_id}"  # Placeholder for dry run - f-string ok here as it's not logging directly
+            logging.info("    Processing source price: %s", source_price_id)
 
-            if dry_run:
-                logging.info(
-                    "      [Dry Run] Would create price for product %s",
-                    target_product_id,
+            target_price_id = _find_or_create_target_price(
+                price, target_product_id, target_stripe, dry_run
+            )
+
+            # The helper function logs details about finding/creating/skipping the price.
+            # We don't store the result here anymore.
+            if not target_price_id and not dry_run:
+                logging.warning(
+                    "      Failed to find or create target price for source %s",
+                    source_price_id,
                 )
-                logging.info("        Source Price ID: %s", source_price_id)
-                logging.info(
-                    "        Currency: %s, Amount: %s",
-                    price.currency,
-                    price.unit_amount,
-                )
-                # Check if price exists in target account even in dry run
-                try:
-                    logging.info(
-                        "      [Dry Run] Checking if price similar to %s exists...",
-                        source_price_id,
-                    )
-                    # Check by metadata first for a more reliable check
-                    target_prices_dry = target_stripe.prices.list(
-                        params={
-                            "product": target_product_id,
-                            "active": True,
-                            "limit": 100,
-                        }
-                    )
-                    found_by_meta = False
-                    for p_dry in target_prices_dry.auto_paging_iter():
-                        if (
-                            p_dry.metadata
-                            and p_dry.metadata.get("source_price_id") == source_price_id
-                        ):
-                            logging.info(
-                                "      [Dry Run] Price linked via metadata %s already exists: %s",
-                                source_price_id,
-                                p_dry.id,
-                            )
-                            price_map[source_price_id] = p_dry.id
-                            found_by_meta = True
-                            break
-                    if not found_by_meta:
-                        # Fallback check by ID (less reliable, might match unrelated price)
-                        try:
-                            existing_price = target_stripe.prices.retrieve(
-                                source_price_id
-                            )
-                            logging.info(
-                                "      [Dry Run] Price %s might exist by ID (less reliable check).",
-                                source_price_id,
-                            )
-                            # Avoid mapping based on ID alone in dry run unless confirmed by metadata
-                            price_map[source_price_id] = target_price_id_placeholder
-                        except stripe.error.InvalidRequestError as e_inner:
-                            if "No such price" in str(e_inner):
-                                logging.info(
-                                    "      [Dry Run] Price %s does not exist by that ID.",
-                                    source_price_id,
-                                )
-                                price_map[source_price_id] = target_price_id_placeholder
-                            else:
-                                logging.warning(
-                                    "      [Dry Run] Error checking for existing price %s by ID: %s",
-                                    source_price_id,
-                                    e_inner,
-                                )
-                                price_map[source_price_id] = target_price_id_placeholder
-                        except stripe.error.StripeError as e_inner:
-                            logging.error(
-                                "      [Dry Run] Stripe error checking for existing price %s by ID: %s",
-                                source_price_id,
-                                e_inner,
-                            )
-                            price_map[source_price_id] = target_price_id_placeholder
-
-                except stripe.error.StripeError as e:
-                    logging.error(
-                        "      [Dry Run] Error listing target prices for check %s: %s",
-                        source_price_id,
-                        e,
-                    )
-                    price_map[source_price_id] = target_price_id_placeholder
-
-            else:  # Actual creation logic
-                try:
-                    # Check if a price with the same source_price_id metadata already exists
-                    existing_target_price = None
-                    try:
-                        target_prices = target_stripe.prices.list(
-                            params={
-                                "product": target_product_id,
-                                "active": True,
-                                "limit": 100,
-                            }
-                        )
-                        for p in target_prices.auto_paging_iter():
-                            if (
-                                p.metadata
-                                and p.metadata.get("source_price_id") == source_price_id
-                            ):
-                                existing_target_price = p
-                                break
-                    except stripe.error.StripeError as list_err:
-                        logging.warning(
-                            "      Warning: Could not list target prices for product %s to check existence: %s",
-                            target_product_id,
-                            list_err,
-                        )
-                        # Continue to attempt creation, relying on creation errors
-
-                    if existing_target_price:
-                        logging.info(
-                            "      Target price linked to source %s already exists: %s. Using existing.",
-                            source_price_id,
-                            existing_target_price.id,
-                        )
-                        price_map[source_price_id] = existing_target_price.id
-                    else:
-                        # Create the price if it doesn't exist
-                        # Consolidate all potential price attributes
-                        price_params = {
-                            "currency": price.currency,
-                            "active": price.active,
-                            "metadata": {
-                                **(
-                                    price.metadata.to_dict_recursive()
-                                    if price.metadata
-                                    else {}
-                                ),
-                                "source_price_id": source_price_id,
-                            },
-                            "nickname": price.get("nickname"),
-                            "product": target_product_id,
-                            "recurring": price.get("recurring"),
-                            "tax_behavior": price.get("tax_behavior"),
-                            "unit_amount": price.get("unit_amount"),
-                            "billing_scheme": price.billing_scheme,
-                            "tiers": price.get("tiers"),
-                            "tiers_mode": price.get("tiers_mode"),
-                            "transform_quantity": price.get("transform_quantity"),
-                            # Ensure custom_unit_amount is included if present
-                            "custom_unit_amount": price.get("custom_unit_amount"),
-                        }
-                        # Remove None values to avoid sending empty optional params
-                        price_params = {
-                            k: v for k, v in price_params.items() if v is not None
-                        }
-
-                        logging.debug(
-                            "      Creating price with params: %s", price_params
-                        )
-                        target_price = target_stripe.prices.create(params=price_params)
-                        logging.info(
-                            "      Created target price: %s (linked to source: %s)",
-                            target_price.id,
-                            source_price_id,
-                        )
-                        price_map[source_price_id] = target_price.id
-                except stripe.error.StripeError as e:
-                    logging.error(
-                        "      Error processing price (linked to source: %s) for product %s: %s",
-                        source_price_id,
-                        target_product_id,
-                        e,
-                    )
-                    # Skip mapping on error during live run.
+                # Optionally, decide if a single price failure should cause the whole product processing to return False
+                # Current logic: continue processing other prices, return True at the end unless source price fetch failed.
 
     except stripe.error.StripeError as e:
-        logging.error("  Error fetching prices for product %s: %s", product_id, e)
+        logging.error(
+            "  Error fetching source prices for product %s: %s", product_id, e
+        )
+        # Depending on requirements, you might want to return None or an empty map
+        # If fetching source prices fails, no prices can be mapped.
+        return False  # Fetching source prices failed
 
-    return price_map
+    # Return True if product creation (if attempted) and source price fetch were successful
+    return True
 
 
 def migrate_products(dry_run: bool = True) -> None:
@@ -443,13 +323,11 @@ def migrate_products(dry_run: bool = True) -> None:
         dry_run: If True, simulates the process without creating resources.
     """
     logging.info("Starting product and price migration (dry_run=%s)...", dry_run)
-    source_stripe = get_stripe_client(API_KEY_SOURCE)  # type: ignore
-    target_stripe = get_stripe_client(API_KEY_TARGET)  # type: ignore
+    source_stripe = get_stripe_client(API_KEY_SOURCE)
+    target_stripe = get_stripe_client(API_KEY_TARGET)
 
     processed_count = 0
-    skipped_count = 0
     failed_count = 0
-    price_maps_aggregated: Dict[str, str] = {}
 
     try:
         # Fetch existing active product IDs from the target account first
@@ -484,7 +362,7 @@ def migrate_products(dry_run: bool = True) -> None:
 
         # Loop through each product and create it in the target account
         for product in product_list:
-            price_map = create_product_and_prices(
+            success = create_product_and_prices(
                 product,
                 source_stripe,
                 target_stripe,
@@ -492,23 +370,16 @@ def migrate_products(dry_run: bool = True) -> None:
                 dry_run,
             )
             processed_count += 1
-            if price_map is not None:
-                price_maps_aggregated.update(price_map)
-            elif not dry_run:  # If it's a live run and price_map is None, it failed
+            if not success and not dry_run:  # Count failure only in live run
                 failed_count += 1
-            else:  # If it's a dry run and price_map is None, it was simulated or skipped
-                skipped_count += (
-                    1  # Refine this if create_product_and_prices gives more status
-                )
+            # Skips are handled/logged within create_product_and_prices
 
         logging.info("Product and price migration completed (dry_run=%s).", dry_run)
         logging.info(
-            "  Processed: %d, Failed: %d, Skipped (dry run): %d",
+            "  Products Processed: %d, Products Failed (live run): %d",
             processed_count,
             failed_count,
-            skipped_count,
         )
-        logging.info("  Total Price Mappings generated: %d", len(price_maps_aggregated))
 
     except stripe.error.StripeError as e:
         logging.error("Error fetching products from source account: %s", e)
@@ -522,8 +393,8 @@ def migrate_coupons(dry_run: bool = True) -> None:
         dry_run: If True, simulates the process without creating resources.
     """
     logging.info("Starting coupon migration (dry_run=%s)...", dry_run)
-    source_stripe = get_stripe_client(API_KEY_SOURCE)  # type: ignore
-    target_stripe = get_stripe_client(API_KEY_TARGET)  # type: ignore
+    source_stripe = get_stripe_client(API_KEY_SOURCE)
+    target_stripe = get_stripe_client(API_KEY_TARGET)
 
     migrated_count = 0
     skipped_count = 0
@@ -670,8 +541,8 @@ def migrate_promocodes(dry_run: bool = True) -> None:
         dry_run: If True, simulates the process without creating resources.
     """
     logging.info("Starting promotion code migration (dry_run=%s)...", dry_run)
-    source_stripe = get_stripe_client(API_KEY_SOURCE)  # type: ignore
-    target_stripe = get_stripe_client(API_KEY_TARGET)  # type: ignore
+    source_stripe = get_stripe_client(API_KEY_SOURCE)
+    target_stripe = get_stripe_client(API_KEY_TARGET)
 
     migrated_count = 0
     skipped_count = 0
