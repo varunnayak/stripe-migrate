@@ -86,8 +86,14 @@ python stripe_migrate.py --step <step_name> [options]
 
 ## License
 
-_(Optional: Add your license information here, e.g., MIT License)_
+This project is licensed under the MIT License - see the [LICENSE.md](LICENSE.md) file for details (or add license text directly here).
 
 ## Contributing
 
-_(Optional: Add guidelines for contributing to the project)_
+Contributions are welcome! Please feel free to submit a pull request or open an issue.
+
+1. Fork the Project
+2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`)
+3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to the Branch (`git push origin feature/AmazingFeature`)
+5. Open a Pull Request
