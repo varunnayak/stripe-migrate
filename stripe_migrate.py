@@ -198,7 +198,7 @@ def create_product_and_prices(
     target_stripe: StripeClient,
     existing_target_product_ids: Set[str],
     dry_run: bool = True,
-) -> bool:
+) -> str:  # Return status string
     """
     Creates a product and its associated active prices from the source account
     in the target Stripe account, utilizing a pre-fetched set of existing target IDs.
@@ -213,12 +213,15 @@ def create_product_and_prices(
     Returns:
         True if the product and its prices were processed successfully (or simulated),
         False if product creation failed or fetching source prices failed.
+        A status string (STATUS_CREATED, STATUS_SKIPPED, STATUS_FAILED, STATUS_DRY_RUN)
+        indicating the result of the operation for this product.
     """
     product_id = product.id
     logging.info("Processing product: %s (%s)", product.name, product_id)
 
     target_product_id = product_id
     target_product = None  # Initialize target_product
+    product_skipped = False  # Initialize flag
 
     # --- Product Handling (Dry Run / Live) ---
     if dry_run:
@@ -230,12 +233,16 @@ def create_product_and_prices(
                 "  [Dry Run] Product %s already exists in the target account (based on pre-fetched list).",
                 product_id,
             )
+            # Don't return STATUS_SKIPPED yet, need to process prices
         else:
             logging.info(
                 "  [Dry Run] Product %s does not exist yet in the target account (based on pre-fetched list). Would create.",
                 product_id,
             )
+            # Don't return STATUS_DRY_RUN yet, need to process prices
         # In dry run, proceed to price simulation regardless of product "existence"
+        # Final status will be STATUS_DRY_RUN if we get to the end
+
     else:
         # Actual creation logic: Use the pre-fetched set
         product_exists = product_id in existing_target_product_ids
@@ -245,6 +252,7 @@ def create_product_and_prices(
                 "  Product %s exists in target account (based on pre-fetched list). Skipping product creation.",
                 product_id,
             )
+            product_skipped = True  # Flag that product creation was skipped
             # We still need the target_product_id which is the same as product_id
             # No API call needed here to retrieve the product object itself.
         else:
@@ -279,12 +287,13 @@ def create_product_and_prices(
                     logging.error(
                         "  Error creating product %s: %s", product_id, create_err
                     )
-                    return False  # Cannot proceed if product creation fails
+                    return STATUS_FAILED  # Cannot proceed if product creation fails
             except stripe.error.StripeError as create_err:
                 logging.error("  Error creating product %s: %s", product_id, create_err)
-                return False  # Cannot proceed if product creation fails
+                return STATUS_FAILED  # Cannot proceed if product creation fails
 
     # --- Price Handling (Dry Run / Live) ---
+    price_creation_failed = False
     try:
         # Fetch active prices from the source account
         prices = source_stripe.prices.list(
@@ -314,17 +323,27 @@ def create_product_and_prices(
                 )
                 # Optionally, decide if a single price failure should cause the whole product processing to return False
                 # Current logic: continue processing other prices, return True at the end unless source price fetch failed.
+                price_creation_failed = True
 
     except stripe.error.StripeError as e:
         logging.error(
             "  Error fetching source prices for product %s: %s", product_id, e
         )
-        # Depending on requirements, you might want to return None or an empty map
         # If fetching source prices fails, no prices can be mapped.
-        return False  # Fetching source prices failed
+        return STATUS_FAILED  # Fetching source prices failed
 
     # Return True if product creation (if attempted) and source price fetch were successful
-    return True
+    # Determine final status based on dry_run, skips, and failures
+    if dry_run:
+        return STATUS_DRY_RUN
+    if price_creation_failed:
+        # If any price failed, mark the whole product as failed
+        return STATUS_FAILED
+    if product_skipped:
+        # If product was skipped AND no prices failed, mark as skipped
+        return STATUS_SKIPPED
+    # If product was created (not skipped) AND no prices failed, mark as created
+    return STATUS_CREATED
 
 
 def migrate_products(dry_run: bool = True) -> None:
@@ -341,6 +360,9 @@ def migrate_products(dry_run: bool = True) -> None:
 
     processed_count = 0
     failed_count = 0
+    created_count = 0
+    skipped_count = 0
+    dry_run_count = 0
 
     try:
         # Fetch existing active product IDs from the target account first
@@ -361,7 +383,10 @@ def migrate_products(dry_run: bool = True) -> None:
                 "Failed to list products from target account: %s. Proceeding without pre-check set.",
                 e,
             )
-            # If listing fails, the inner check in create_product_and_prices will still work (less efficient)
+            logging.error(
+                "Cannot reliably migrate products without the list of existing target products. Exiting."
+            )
+            return
 
         # Fetch active products from the source account
         logging.info("Fetching active products from source account...")
@@ -375,7 +400,7 @@ def migrate_products(dry_run: bool = True) -> None:
 
         # Loop through each product and create it in the target account
         for product in product_list:
-            success = create_product_and_prices(
+            status = create_product_and_prices(
                 product,
                 source_stripe,
                 target_stripe,
@@ -383,9 +408,25 @@ def migrate_products(dry_run: bool = True) -> None:
                 dry_run,
             )
             processed_count += 1
-            if not success and not dry_run:  # Count failure only in live run
+            if not status and not dry_run:  # Count failure only in live run
                 failed_count += 1
             # Skips are handled/logged within create_product_and_prices
+
+            if status == STATUS_CREATED:
+                created_count += 1
+            elif status == STATUS_SKIPPED:
+                skipped_count += 1
+            elif status == STATUS_FAILED:
+                failed_count += 1
+            elif status == STATUS_DRY_RUN:
+                dry_run_count += 1
+            else:
+                logging.error(
+                    "Unknown status '%s' returned for product %s. Treating as failed.",
+                    status,
+                    product.id,
+                )
+                failed_count += 1
 
         logging.info("Product and price migration completed (dry_run=%s).", dry_run)
         logging.info(
@@ -393,6 +434,16 @@ def migrate_products(dry_run: bool = True) -> None:
             processed_count,
             failed_count,
         )
+        if dry_run:
+            logging.info("  Results (dry run) - Would Process: %d", dry_run_count)
+            # Note: Dry run doesn't distinguish created/skipped/failed easily in summary
+        else:
+            logging.info(
+                "  Results (live run) - Created: %d, Skipped: %d, Failed: %d",
+                created_count,
+                skipped_count,
+                failed_count,
+            )
 
     except stripe.error.StripeError as e:
         logging.error("Error fetching products from source account: %s", e)
@@ -434,7 +485,10 @@ def migrate_coupons(dry_run: bool = True) -> None:
                 "Failed to list coupons from target account: %s. Proceeding without coupon pre-check set.",
                 e,
             )
-            # Coupon existence check will happen individually, less efficient
+            logging.error(
+                "Cannot reliably migrate coupons without the list of existing target coupons. Exiting."
+            )
+            return
 
         # --- Pre-fetch Target Promo Codes (by Code string) ---
         logging.info("Fetching existing active promo codes from target account...")
@@ -454,7 +508,10 @@ def migrate_coupons(dry_run: bool = True) -> None:
                 "Failed to list promo codes from target account: %s. Proceeding without promo code pre-check set.",
                 e,
             )
-            # Promo code existence check will happen individually, less efficient
+            logging.error(
+                "Cannot reliably migrate promo codes without the list of existing target promo codes. Exiting."
+            )
+            return
 
         # Fetch coupons from source account
         logging.info("Fetching coupons from source account...")
@@ -738,7 +795,7 @@ def migrate_coupons(dry_run: bool = True) -> None:
 
 # Helper function to ensure a default payment method exists for the customer in the target account
 def _ensure_payment_method(
-    customer_id: str, target_stripe: StripeClient, source_stripe: StripeClient
+    customer_id: str, target_stripe: StripeClient
 ) -> Optional[str]:
     """
     Checks for and sets up a default payment method for a customer in the target account.
@@ -750,7 +807,6 @@ def _ensure_payment_method(
     Args:
         customer_id: The Stripe Customer ID.
         target_stripe: Initialized Stripe client for the target account.
-        source_stripe: Initialized Stripe client for the source account.
 
     Returns:
         The ID of the default payment method in the target account, or None if setup failed.
@@ -843,7 +899,8 @@ def recreate_subscription(
         dry_run: If True, simulates the process without creating the subscription.
 
     Returns:
-        A status string indicating the result of the operation.
+        A status string (STATUS_CREATED, STATUS_SKIPPED, STATUS_FAILED, STATUS_DRY_RUN)
+        indicating the result of the operation for this specific subscription.
     """
     source_subscription_id = subscription.id
     # Ensure customer_id is retrieved correctly (it can be an object or a string)
@@ -921,9 +978,7 @@ def recreate_subscription(
         return STATUS_DRY_RUN
 
     # --- Fetch/Attach Payment Method (using helper function) ---
-    payment_method_id = _ensure_payment_method(
-        customer_id, target_stripe, source_stripe
-    )
+    payment_method_id = _ensure_payment_method(customer_id, target_stripe)
 
     # Ensure we have a payment method ID before proceeding
     if not payment_method_id:
@@ -986,8 +1041,11 @@ def recreate_subscription(
                     source_subscription_id,
                     update_err,
                 )
-                # Decide if this error should change the overall status.
                 # For now, we log the error but still return STATUS_CREATED for the target creation.
+                logging.error(
+                    "    FAILED TO CANCEL SOURCE SUBSCRIPTION %s AT PERIOD END. Manual intervention may be required in the source account.",
+                    source_subscription_id,
+                )
 
         return STATUS_CREATED
     except stripe.error.StripeError as e:
