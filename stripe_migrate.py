@@ -825,20 +825,19 @@ def _ensure_payment_method(
 def recreate_subscription(
     subscription: Dict[str, Any],
     price_mapping: Dict[str, str],
-    existing_target_subs_by_customer: Dict[str, set[frozenset[str]]],
+    existing_target_subs_by_metadata: Dict[str, str],
     target_stripe: StripeClient,
     source_stripe: StripeClient,
     dry_run: bool = True,
 ) -> str:  # Return only status
     """
-    Recreates a given subscription in the target Stripe account, using pre-fetched data
-    to check for existing subscriptions.
+    Recreates a given subscription in the target Stripe account, checking metadata
+    to prevent duplicates using a pre-fetched map.
 
     Args:
         subscription: The subscription object from the source Stripe account.
         price_mapping: A dictionary mapping source price IDs to target price IDs.
-        existing_target_subs_by_customer: A dictionary mapping customer IDs to sets of frozensets of price IDs
-                                           for their active subscriptions in the target account.
+        existing_target_subs_by_metadata: Dict mapping source_sub_id to target_sub_id for existing target subs.
         target_stripe: Initialized Stripe client for the target account.
         source_stripe: Initialized Stripe client for the source account.
         dry_run: If True, simulates the process without creating the subscription.
@@ -858,6 +857,25 @@ def recreate_subscription(
         source_subscription_id,
         customer_id,
     )
+
+    # --- Check for existing migrated subscription using the pre-fetched map --- (New Check)
+    if source_subscription_id in existing_target_subs_by_metadata:
+        target_sub_id = existing_target_subs_by_metadata[source_subscription_id]
+        log_prefix = "[Dry Run] " if dry_run else ""
+        logging.info(
+            "  %sSkipping: Target subscription %s already exists (found via pre-fetched metadata source_subscription_id=%s).",
+            log_prefix,
+            target_sub_id,
+            source_subscription_id,
+        )
+        return STATUS_SKIPPED
+    else:
+        # Log check only if not found, to reduce noise
+        logging.debug(
+            "  No existing target subscription found in pre-fetched metadata map."
+        )
+
+    # --- Proceed with mapping and creation only if not skipped ---
 
     if not price_mapping:
         logging.error(
@@ -890,34 +908,16 @@ def recreate_subscription(
 
     logging.debug("  Mapped target items: %s", target_items)
 
-    # --- Check for existing active subscription in target account using pre-fetched data --- (Optimization)
-    target_price_ids_frozenset = frozenset(target_price_ids_set)
-    if customer_id in existing_target_subs_by_customer:
-        customer_existing_subs_price_sets = existing_target_subs_by_customer[
-            customer_id
-        ]
-        if target_price_ids_frozenset in customer_existing_subs_price_sets:
-            logging.info(
-                "  Skipping: Customer %s already has an active subscription with the same price IDs (based on pre-fetched list).",
-                customer_id,
-            )
-            # Cannot easily get the existing sub ID from this structure
-            return STATUS_SKIPPED
-
-    # --- Dry Run Simulation ---
+    # --- Dry Run Simulation --- (Now handled earlier by metadata check)
     if dry_run:
+        # The actual creation logic is skipped, but we already logged the 'would check'
+        # and potentially 'would create' based on the metadata check outcome.
+        # We just need to return the correct status.
+        # If the metadata check indicated it *would* exist, we'd return STATUS_DRY_RUN (or maybe a new STATUS_DRY_RUN_SKIPPED?)
+        # For simplicity, let's stick to STATUS_DRY_RUN if it gets past the metadata check phase in dry_run mode.
         logging.info(
-            "  [Dry Run] Would create subscription for customer %s", customer_id
+            "  [Dry Run] Subscription creation would proceed if not for dry run."
         )
-        logging.info("    Items: %s", target_items)
-        # Use current_period_end as the trial_end for the new subscription
-        trial_end_ts = subscription.get("current_period_end")
-        logging.info("    Trial End (from source current_period_end): %s", trial_end_ts)
-        logging.info("    Default Payment Method: To be fetched and attached if needed")
-        logging.info(
-            "    Metadata: {'source_subscription_id': '%s'}", source_subscription_id
-        )
-        logging.info("  [Dry Run] Subscription creation skipped.")
         return STATUS_DRY_RUN
 
     # --- Fetch/Attach Payment Method (using helper function) ---
@@ -1014,38 +1014,50 @@ def migrate_subscriptions(dry_run: bool = True) -> None:
         return  # Exit if map cannot be built
     # --- End build price mapping ---
 
-    # --- Pre-fetch existing active target subscriptions --- (Optimization)
-    logging.info("Pre-fetching existing active subscriptions from target account...")
-    existing_target_subs_by_customer: Dict[str, set[frozenset[str]]] = {}
+    # --- Pre-fetch existing target subscriptions by metadata --- (Optimization)
+    logging.info(
+        "Pre-fetching existing target subscriptions and checking for 'source_subscription_id' metadata..."
+    )
+    existing_target_subs_by_metadata: Dict[str, str] = {}
     try:
+        # Fetch all non-canceled, then filter locally
         target_subscriptions = target_stripe.subscriptions.list(
             params={
-                "status": "active",
+                # Fetch all non-canceled, then filter locally
+                "status": "all",
                 "limit": 100,
-                "expand": ["data.customer"],
-            }  # Expand customer
+                # Metadata included by default
+            }
         )
         for sub in target_subscriptions.auto_paging_iter():
-            # Ensure customer access is robust
-            customer_field = sub.customer
-            customer_id: str = (
-                customer_field if isinstance(customer_field, str) else customer_field.id
-            )
-            price_ids = frozenset(item.price.id for item in sub.items.data)
-            if customer_id not in existing_target_subs_by_customer:
-                existing_target_subs_by_customer[customer_id] = set()
-            existing_target_subs_by_customer[customer_id].add(price_ids)
+            # Filter locally for desired statuses
+            if sub.status not in ["active", "trialing"]:
+                continue  # Skip if not active or trialing
+
+            # Metadata should be directly accessible here as sub.metadata
+            if (
+                sub.metadata  # Check if metadata exists first
+                and "source_subscription_id" in sub.metadata
+            ):
+                source_id = sub.metadata["source_subscription_id"]
+                if source_id in existing_target_subs_by_metadata:
+                    logging.warning(
+                        "  Duplicate source_subscription_id %s found in target metadata. Target Sub IDs: %s, %s",
+                        source_id,
+                        existing_target_subs_by_metadata[source_id],
+                        sub.id,
+                    )
+                existing_target_subs_by_metadata[source_id] = sub.id
         logging.info(
-            "Found active subscriptions for %d customers in target account.",
-            len(existing_target_subs_by_customer),
+            "Found %d existing target subscriptions with 'source_subscription_id' metadata.",
+            len(existing_target_subs_by_metadata),
         )
     except stripe.error.StripeError as e:
         logging.error(
-            "Error pre-fetching target subscriptions: %s. Proceeding without pre-check data.",
+            "Error pre-fetching target subscriptions for metadata check: %s. Proceeding without pre-check data.",
             e,
         )
-        # Let the script continue, checks inside recreate_subscription will fallback or fail
-    # --- End pre-fetch target subscriptions ---
+        return  # Exit if map cannot be built
 
     created_count = 0
     skipped_count = 0
@@ -1072,7 +1084,7 @@ def migrate_subscriptions(dry_run: bool = True) -> None:
             status = recreate_subscription(
                 subscription,
                 price_mapping,
-                existing_target_subs_by_customer,  # Pass pre-fetched data
+                existing_target_subs_by_metadata,  # Pass pre-fetched map
                 target_stripe,
                 source_stripe,
                 dry_run,
@@ -1133,7 +1145,7 @@ def main() -> None:
         type=str,
         choices=["products", "coupons", "subscriptions", "all"],
         required=True,
-        help="Specify which migration step to run: products, coupons (includes promo codes), subscriptions, or all (default).",
+        help="Specify which migration step to run: products, coupons, subscriptions, or all (default).",
     )
 
     args = parser.parse_args()
