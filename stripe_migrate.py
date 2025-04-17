@@ -964,6 +964,31 @@ def recreate_subscription(
             target_subscription.id,
             source_subscription_id,
         )
+
+        # --- Update source subscription to cancel at period end ---
+        if not dry_run:  # Ensure this only happens in a live run
+            try:
+                logging.info(
+                    "    Attempting to set cancel_at_period_end=True for source subscription %s",
+                    source_subscription_id,
+                )
+                source_stripe.subscriptions.update(
+                    source_subscription_id,
+                    params={"cancel_at_period_end": True},
+                )
+                logging.info(
+                    "    Successfully set cancel_at_period_end=True for source subscription %s",
+                    source_subscription_id,
+                )
+            except stripe.error.StripeError as update_err:
+                logging.error(
+                    "    Error updating source subscription %s to cancel at period end: %s",
+                    source_subscription_id,
+                    update_err,
+                )
+                # Decide if this error should change the overall status.
+                # For now, we log the error but still return STATUS_CREATED for the target creation.
+
         return STATUS_CREATED
     except stripe.error.StripeError as e:
         logging.error(
