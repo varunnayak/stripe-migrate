@@ -991,21 +991,42 @@ def recreate_subscription(
 
     # --- Create the subscription in the target account ---
     try:
+        # Check the source subscription's cancel_at_period_end status
+        source_cancels_at_period_end = subscription.get("cancel_at_period_end", False)
+        logging.debug(
+            "  Source subscription cancel_at_period_end: %s",
+            source_cancels_at_period_end,
+        )
+
+        # ---> Get additional parameters <---
+        source_collection_method = subscription.get("collection_method")
+        source_metadata = (
+            subscription.metadata.to_dict_recursive() if subscription.metadata else {}
+        )
+        # Merge source metadata with the new ID
+        target_metadata = {
+            **source_metadata,
+            "source_subscription_id": source_subscription_id,
+        }
+
         subscription_params = {
             "customer": customer_id,
             "items": target_items,
             # Use current_period_end from source as trial_end for the new sub
             # Stripe expects an integer timestamp
             "trial_end": subscription.get("current_period_end"),
-            "metadata": {"source_subscription_id": source_subscription_id},
+            "metadata": target_metadata,
             # Crucially, ensure the default payment method is used for future invoices
             "default_payment_method": payment_method_id,
             # Prorate behavior might need adjustment based on migration strategy
             # "proration_behavior": "none", # Example: disable proration initially
             # Off session is important if customer isn't actively involved
             "off_session": True,
+            "cancel_at_period_end": source_cancels_at_period_end,
+            "collection_method": source_collection_method,
         }
         # Remove None values, especially for trial_end if not present
+        # Also remove collection_method if it was None (shouldn't happen but safety)
         subscription_params = {
             k: v for k, v in subscription_params.items() if v is not None
         }
@@ -1021,10 +1042,11 @@ def recreate_subscription(
         )
 
         # --- Update source subscription to cancel at period end ---
-        if not dry_run:  # Ensure this only happens in a live run
+        # Only attempt to cancel the source if it wasn't already canceling
+        if not dry_run and not source_cancels_at_period_end:
             try:
                 logging.info(
-                    "    Attempting to set cancel_at_period_end=True for source subscription %s",
+                    "    Attempting to set cancel_at_period_end=True for source subscription %s (as it wasn't set before)",
                     source_subscription_id,
                 )
                 source_stripe.subscriptions.update(
