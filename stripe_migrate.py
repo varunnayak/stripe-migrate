@@ -1009,6 +1009,7 @@ def recreate_subscription(
             "source_subscription_id": source_subscription_id,
         }
 
+        # Define subscription parameters BEFORE handling discount
         subscription_params = {
             "customer": customer_id,
             "items": target_items,
@@ -1025,8 +1026,52 @@ def recreate_subscription(
             "cancel_at_period_end": source_cancels_at_period_end,
             "collection_method": source_collection_method,
         }
-        # Remove None values, especially for trial_end if not present
-        # Also remove collection_method if it was None (shouldn't happen but safety)
+
+        # ---> Handle Discount <----
+        source_discount = subscription.get("discount")  # Assign to source_discount
+
+        if source_discount:  # Check if it's truthy
+            # Proceed with existing logic based on coupon/promo code
+            if source_discount.coupon:
+                source_coupon_id = source_discount.coupon.id
+                subscription_params["coupon"] = source_coupon_id
+                logging.info(
+                    "    Applying coupon %s to target subscription.", source_coupon_id
+                )
+            elif source_discount.promotion_code:
+                # Use the promo code string directly, API accepts it
+                source_promo_code_obj = source_discount.promotion_code
+                if source_promo_code_obj and isinstance(
+                    source_promo_code_obj, stripe.PromotionCode
+                ):
+                    source_promo_code_str = source_promo_code_obj.code
+                    # Add to existing dict
+                    subscription_params["promotion_code"] = source_promo_code_str
+                    logging.info(
+                        "    Applying promotion code %s to target subscription.",
+                        source_promo_code_str,
+                    )
+                else:
+                    logging.warning(
+                        "    Could not determine promotion code string from discount object: %s. Discount not applied.",
+                        source_discount.promotion_code,  # Log what was received
+                    )
+            else:
+                logging.warning(
+                    "    Source discount object %s (Type: %s) has neither .coupon nor .promotion_code attribute, or they are falsy.",
+                    (
+                        source_discount.id
+                        if hasattr(source_discount, "id")
+                        else "UNKNOWN_ID"
+                    ),
+                    type(source_discount),
+                )
+        else:
+            logging.debug(
+                "  Source subscription does not have an active discount (source_discount is falsy)."
+            )
+
+        # Remove None values AFTER potential discount addition
         subscription_params = {
             k: v for k, v in subscription_params.items() if v is not None
         }
@@ -1175,8 +1220,8 @@ def migrate_subscriptions(dry_run: bool = True) -> None:
             params={
                 "status": "active",
                 "limit": 100,
-                # Expand customer and items.price for consistent access
-                "expand": ["data.customer", "data.items.data.price"],
+                # Expand customer, items.price, and discount for consistent access
+                "expand": ["data.customer", "data.items.data.price", "data.discount"],
             }
         )
         subs_list = list(subscriptions.auto_paging_iter())
