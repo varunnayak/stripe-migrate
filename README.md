@@ -49,6 +49,8 @@ python stripe_migrate.py --step <step_name> [options]
   - `all`: Runs all steps sequentially (products -> coupons -> subscriptions).
 - `--live`: (Optional) Performs the migration live. If omitted, the script runs in **dry run mode** by default, only logging what actions _would_ be taken.
 - `--debug`: (Optional) Enables detailed debug logging output.
+- `--unarchive-prices`: (Optional) Explicitly indicates that inactive prices should be unarchived during migration (this is the default behavior).
+- `--keep-price-status`: (Optional) Preserves the original active/inactive status of prices when migrating. Overrides `--unarchive-prices`.
 
 **Examples:**
 
@@ -64,6 +66,10 @@ python stripe_migrate.py --step <step_name> [options]
   ```bash
   python stripe_migrate.py --step subscriptions --debug
   ```
+- **Live migration of products while preserving price active/inactive status:**
+  ```bash
+  python stripe_migrate.py --step products --live --keep-price-status
+  ```
 
 ## Important Considerations
 
@@ -73,7 +79,10 @@ python stripe_migrate.py --step <step_name> [options]
   - It adds `source_promotion_code_id` to target promotion codes.
   - It adds `source_subscription_id` to target subscriptions.
     This metadata is crucial, especially for mapping prices during subscription migration.
+- **Customers:** Before migrating subscriptions, customers must be copied from the source to target account. This can be done using the copy button in the Stripe dashboard's customers page. The script does not create customers; it expects them to already exist in the target account with the same IDs as in the source account.
 - **Payment Methods:** For subscription migration, the script checks if the target customer has a default payment method or an attached card. If not, it **cannot** create the subscription. It **does not** currently migrate payment methods themselves due to complexity and security implications (often requiring customer interaction). You need to ensure customers have valid payment methods in the target account _before_ migrating subscriptions.
+- **Archived Prices:** Subscription creation will fail if the corresponding price in the target account is archived. By default, the script will unarchive inactive prices during migration. You can preserve the original active/inactive status using the `--keep-price-status` flag.
+- **Invalid Coupons:** Subscription creation will fail if an applied coupon is invalid due to maximum redemptions being reached or the redemption period having expired. The script does not modify coupon validity settings during migration.
 - **Trial Periods:** Migrated subscriptions have their `trial_end` set to the `current_period_end` of the source subscription.
 - **API Keys:** Ensure you are using the correct **secret keys** for both accounts. Using restricted keys might lead to permission errors.
 - **Error Handling:** The script includes basic error handling for Stripe API calls, but complex scenarios might require manual intervention. Review the logs carefully.

@@ -58,6 +58,7 @@ def _find_or_create_target_price(
     target_product_id: str,
     target_stripe: StripeClient,
     dry_run: bool,
+    unarchive_prices: bool = True,
 ) -> Optional[str]:
     """
     Checks if a target price corresponding to the source price exists,
@@ -73,7 +74,9 @@ def _find_or_create_target_price(
         target_prices = target_stripe.prices.list(
             params={
                 "product": target_product_id,
-                "active": True,
+                "active": (
+                    None if unarchive_prices else True
+                ),  # Include both active and inactive prices
                 "limit": 100,
             }
         )
@@ -141,7 +144,7 @@ def _find_or_create_target_price(
             # Prepare parameters
             price_params = {
                 "currency": source_price.currency,
-                "active": source_price.active,
+                "active": True if unarchive_prices else source_price.active,
                 "metadata": {
                     **(
                         source_price.metadata.to_dict_recursive()
@@ -189,6 +192,7 @@ def create_product_and_prices(
     target_stripe: StripeClient,
     existing_target_product_ids: Set[str],
     dry_run: bool = True,
+    unarchive_prices: bool = True,
 ) -> str:  # Return status string
     """
     Creates a product and its associated active prices from the source account
@@ -275,12 +279,16 @@ def create_product_and_prices(
     # --- Price Handling (Dry Run / Live) ---
     price_creation_failed = False
     try:
-        # Fetch active prices from the source account
+        # Fetch prices from the source account
         prices = source_stripe.prices.list(
-            params={"product": product_id, "active": True, "limit": 100}
+            params={
+                "product": product_id,
+                "active": None if unarchive_prices else True,
+                "limit": 100,
+            }
         )
         logging.info(
-            "  Found %d active price(s) for source product %s",
+            "  Found %d price(s) for source product %s",
             len(prices.data),
             product_id,
         )
@@ -291,7 +299,7 @@ def create_product_and_prices(
             logging.info("    Processing source price: %s", source_price_id)
 
             target_price_id = _find_or_create_target_price(
-                price, target_product_id, target_stripe, dry_run
+                price, target_product_id, target_stripe, dry_run, unarchive_prices
             )
 
             if not target_price_id and not dry_run:
@@ -317,7 +325,7 @@ def create_product_and_prices(
     return STATUS_CREATED
 
 
-def migrate_products(dry_run: bool = True) -> None:
+def migrate_products(dry_run: bool = True, unarchive_prices: bool = True) -> None:
     """
     Migrates all active products and their active prices from the source Stripe
     account to the target Stripe account.
@@ -372,6 +380,7 @@ def migrate_products(dry_run: bool = True) -> None:
                 target_stripe,
                 existing_target_product_ids,
                 dry_run,
+                unarchive_prices,
             )
             processed_count += 1
 
@@ -940,6 +949,16 @@ def recreate_subscription(
             "collection_method": source_collection_method,
         }
 
+        # Add days_until_due for send_invoice collection method
+        if source_collection_method == "send_invoice":
+            # Default to 30 days if not specified in source subscription
+            days_until_due = subscription.get("days_until_due", 30)
+            subscription_params["days_until_due"] = days_until_due
+            logging.info(
+                "    Setting days_until_due=%d for send_invoice collection method",
+                days_until_due,
+            )
+
         # Handle discount
         source_discount = subscription.get("discount")
         if source_discount:
@@ -1026,9 +1045,6 @@ def migrate_subscriptions(dry_run: bool = True) -> None:
     logging.info("Building price map from target account metadata...")
     price_mapping: Dict[str, str] = {}
     try:
-        # Use active=None to potentially catch inactive prices if needed,
-        # but usually mapping active source to active target is desired.
-        # Stick with active=True based on original scripts.
         prices = target_stripe.prices.list(params={"limit": 100, "active": True})
         for price in prices.auto_paging_iter():
             if price.metadata and "source_price_id" in price.metadata:
@@ -1185,6 +1201,16 @@ def main() -> None:
         required=True,
         help="Specify which migration step to run: products, coupons, subscriptions, or all (default).",
     )
+    parser.add_argument(
+        "--unarchive-prices",
+        action="store_true",
+        help="Unarchive inactive prices when migrating. Default is True.",
+    )
+    parser.add_argument(
+        "--keep-price-status",
+        action="store_true",
+        help="Keep the active/inactive status of prices when migrating. Overrides --unarchive-prices.",
+    )
 
     args = parser.parse_args()
 
@@ -1194,16 +1220,19 @@ def main() -> None:
         logging.debug("Debug logging enabled.")
 
     is_dry_run = not args.live
+    # If keep_price_status is specified, it takes precedence over unarchive_prices
+    unarchive_prices = not args.keep_price_status
 
     logging.info(
-        "Starting Stripe data migration... (Step: %s, Dry Run: %s)",
+        "Starting Stripe data migration... (Step: %s, Dry Run: %s, Unarchive Prices: %s)",
         args.step,
         is_dry_run,
+        unarchive_prices,
     )
 
     # Run migrations based on the selected step
     if args.step in ["products", "all"]:
-        migrate_products(dry_run=is_dry_run)
+        migrate_products(dry_run=is_dry_run, unarchive_prices=unarchive_prices)
 
     if args.step in ["coupons", "all"]:
         migrate_coupons(dry_run=is_dry_run)
