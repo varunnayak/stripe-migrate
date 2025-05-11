@@ -858,7 +858,7 @@ def recreate_subscription(
             break
 
         target_price_id = price_mapping[source_price_id]
-        target_items.append({"price": target_price_id})
+        target_items.append({"price": target_price_id, "quantity": item["quantity"]})
 
     if has_mapping_error:
         return STATUS_FAILED
